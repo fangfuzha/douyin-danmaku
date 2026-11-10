@@ -7,6 +7,8 @@
 - 实时接收并打印直播间弹幕、礼物、进入、点赞、关注、粉丝团、热门弹幕等消息
 - 支持**游客身份**（匿名，只带 `ttwid`）与**登录身份**（从本机 Edge 浏览器静默读取 Cookie）两种连接方式
 - 签名在本地计算：内置抖音网页的 `sign.js`，由内嵌的 QuickJS 引擎执行，无需外部浏览器
+- **断线自动重连**（指数退避），**未开播时自动轮询等待开播**
+- 心跳间隔自适应服务端下发的 `heartbeatDuration`
 
 ## 运行
 
@@ -23,6 +25,16 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 ```
 
 不传房间号时，程序会提示你手动输入。构建产物在 `target/release/douyin-danmaku.exe`。
+
+### 命令行参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `<房间号或链接>` | 交互式询问 | 直播间短号（web_rid）或分享链接 |
+| `--edge-cookie` / `--edge` | 关闭 | 从本机 Edge 静默读取登录 Cookie |
+| `--poll-secs <秒>` | `10` | 未开播时的轮询间隔 |
+| `--max-retries <次数>` | `0`（无限） | 断线重连的最大次数，0 表示一直重连 |
+| `--ack` | 关闭 | 开启服务端 `needAck` 应答（实验性，见下文） |
 
 ## 输出说明
 
@@ -54,7 +66,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 - `1%7C` 是 `1|` 的 URL 编码，后面跟一段服务端签名/加密串，整体作为 `Set-Cookie: ttwid=...` 下发
 - 它相当于匿名会话的"设备身份"：WebSocket 连接必须带上它，否则服务端会拒绝连接或把连接降权
 - 有效期由服务端控制（通常一天量级），过期后重新访问直播间页面即可拿到新的
-- 程序里它来自访问直播间页面时响应头的 `Set-Cookie`，并在每次运行时重新获取
+- 程序里它来自访问直播间页面时响应头的 `Set-Cookie`，并在每次运行时重新获取；断线重连多次后也会自动刷新
 
 ### room_id
 
@@ -69,27 +81,48 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 
 程序流程是：用短号打开直播间页面 → 从 HTML 里提取 `roomId` → 用 `room_id` 拼接 WebSocket 地址并订阅该房间。弹幕消息里的 `wss_push_room_id`、`internal_ext` 也都是这个真实号。
 
-## 参考项目
+> ⚠️ `room_id` 是**场次标识**，主播每次开播都会变，不能当作直播间的稳定唯一标识。要长期跟踪同一个主播，请记录它的 `sec_uid` 或主页地址。（这一点来自 DouyinBarrageGrab 的作者说明。）
 
-本项目的协议实现参考了开源项目 **[BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)**（C# / .NET 8 WPF，支持抖音、快手、视频号等多平台的 wss 弹幕直连）。它的抖音部分同样是自己解析 protobuf、自己拼 wss 地址、自己获取 `ttwid`，本项目的直连逻辑、`internal_ext` 拼装方式、`identity=audience` 等参数都与它一致。
+## 参考项目与实现对照
 
-两者主要差异：
+本项目的协议与工程实现参考了下面这些开源项目。下表列出**每一项优化分别借鉴了谁**，方便日后本项目失效时按图索骥地修复。
 
-| | BarrageGrab | douyin-danmaku |
+### 已参考并落地的部分
+
+| 本项目的能力 | 参考项目 | 具体借鉴内容 |
 | --- | --- | --- |
-| 语言/形态 | C# / .NET 8 桌面 GUI（WPF） | Rust 命令行程序，单文件可执行 |
-| 平台 | 抖音、快手、视频号、Tiktok、B 站等 | 仅抖音 |
-| 签名 | `signature` 填占位值 `00000000` | 内嵌 `sign.js`，由 QuickJS 本地算出**真实签名** |
-| 登录态 | 手工填入 Cookie | 从本机 Edge 静默读取已解密 Cookie |
-| 输出 | 图形界面 + 本地 WebSocket 转发 | 终端直接打印 |
+| wss 直连、`internal_ext` 拼装、`identity=audience`、自取 `ttwid` | [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8）、[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像） | 抖音直播的连接参数拼装方式 |
+| 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 `BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto` | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
+| Cookie 组合（`ttwid + msToken + __ac_nonce`） | BarrageGrab（`GenerateMsToken` / `GetTtwid` / `GetRoomId`） | msToken 为 107 位随机串，`__ac_nonce` 为 `0` + 20 位随机串 |
+| 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
+| protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
+| 心跳间隔跟随服务端 | [Simple Live 的协议拆解](https://blog.gitcode.com/0268abd9f86d85f8609446d3d803368e.html) | 服务端 `heartbeatDuration` 下发后按其心跳，客户端把间隔限制在 1~120 秒 |
+| `needAck` 应答 | 同上（Simple Live 在 `needAck` 为真时回 `payloadType='ack'` 帧） | 本项目实现为可选开关 `--ack`（默认关闭：BarrageGrab 与 DouyinLiveWebFetcher 不回 ack 也能正常工作，保持默认行为以降低风险） |
+| 断线重连 | [jwwsjlm/douyinLive](https://github.com/jwwsjlm/douyinLive)（Go，LiveTap 的采集内核）、[tiangalon/dy_danmaku_java](https://github.com/tiangalon/dy_danmaku_java)（Java） | 断线自动重连 + 退避间隔 + 未开播轮询 + 保活 |
+| 抗风控/稳定性思路 | [lihuanpeng/DouyinBarrageGrab](https://github.com/lihuanpeng/DouyinBarrageGrab)（C#，MIT） | 轮询兜底模式、`room_id` 是场次标识的提醒 |
+| 事件类型枚举（表情弹幕、富文本等） | [haohanliubu/dydy](https://github.com/haohanliubu/dydy)（TypeScript/Vue） | `WebcastEmojiChatMessage`、`WebcastRoomDataSyncMessage`、`CastRtfContent` 等类型定义 |
 
-另外，签名参数的具体拼装顺序（13 个参数、顺序敏感）沿用自一个 Python 版本实现（`danmu_ws.py`），该 Python 脚本不在本仓库内，仅作为对照参考。
+### 已调研、暂未实现（留作后续修复时的备选）
+
+如果本项目某天失效（抖音改了协议），下面这些是值得直接借鉴的现成实现，按"改动量从小到大"排列：
+
+| 能力 | 可借鉴的项目 | 说明 |
+| --- | --- | --- |
+| IM 预取接口 | Simple Live 的协议拆解、jwwsjlm/douyinLive | 连接前先请求 `https://live.douyin.com/webcast/im/fetch/`，从响应里取 `pushServer` / `cursor` / `internalExt` / `heartbeatDuration`，比本项目硬编码 `webcast100-ws-web-lq` 域名与手工拼 `internal_ext` 更稳 |
+| 备用推送域名 | Simple Live、dyhub | 预生成 `webcast3/webcast5` 多组域名，连接失败自动切换并刷新上下文 |
+| 多房间并发 | jwwsjlm/douyinLive、dyhub | 每个房间独立任务与状态机，节点可横向扩容 |
+| 统一事件协议 + 分发 | [ymstar/dyhub](https://github.com/ymstar/dyhub)（TypeScript，2026-11 仍在更新） | 抖音私有 protobuf → 标准化 `DanmakuEvent`，再经 WS / SSE / Webhook 三通道分发；"上游改协议不碰消费端"的解耦思路很值得抄 |
+| 服务化与可观测 | jwwsjlm/douyinLive、LiveTap | 只读 HTTP API、批量状态查询、URL 解析、Prometheus 指标 |
+| 落库与后台 | littlezo/dy-danmu、[cyber-xiaoya/cyber-xiaoya-danmaku](https://github.com/cyber-xiaoya/cyber-xiaoya-danmaku) | 弹幕/礼物入库、Web 后台、数字人桥接 |
+| 轮询模式兜底 | lihuanpeng/DouyinBarrageGrab 的 `forcePolling` | ws 断连时改用 HTTP 轮询，慢但绝对稳定 |
+| 多语言 SDK | [lulajax/DouyinLiveJava](https://github.com/lulajax/DouyinLiveJava)、[Vz7797/LiveTap](https://github.com/Vz7797/LiveTap) | 事件分发模型与 SDK 形态参考 |
+| 签名简化 | littlezo/dy-danmu | 用 JS 解释器直接调 `frontierSign()`，可省掉整个 `sign.js` 与 QuickJS 依赖 |
 
 > 弹幕协议是抖音的私有协议，随时可能变。项目仅供学习研究使用，请遵守平台规则，不要用于商业或高频压测。
 
 ## 如何调试
 
-- 跑测试（含签名冒烟测试与 protobuf 解析性能对比）：
+- 跑测试（含签名冒烟、帧协议解析、protobuf 解析性能对比）：
 
   ```powershell
   cargo test --release --package douyin-danmaku --lib -- --nocapture
