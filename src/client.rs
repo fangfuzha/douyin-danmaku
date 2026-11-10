@@ -595,3 +595,254 @@ impl DanmakuClient {
         }
     }
 }
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // ---------- protobuf 编码辅助：构造一条合成的弹幕帧 ----------
+    fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn put_bytes_field(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+        put_varint(out, ((field as u64) << 3) | 2);
+        put_varint(out, data.len() as u64);
+        out.extend_from_slice(data);
+    }
+
+    fn put_varint_field(out: &mut Vec<u8>, field: u32, v: u64) {
+        put_varint(out, (field as u64) << 3);
+        put_varint(out, v);
+    }
+
+    fn synthetic_frame() -> Vec<u8> {
+        let mut user = Vec::new();
+        put_varint_field(&mut user, 1, 7_314_298_754_668_572_38);
+        put_bytes_field(&mut user, 3, "测试用户".as_bytes());
+
+        let mut payload = Vec::new();
+        put_bytes_field(&mut payload, 2, &user);
+        put_bytes_field(&mut payload, 3, "这是一条测试弹幕内容".as_bytes());
+
+        let mut frame = Vec::new();
+        for method in [
+            "WebcastChatMessage",
+            "WebcastMemberMessage",
+            "WebcastRoomUserSeqMessage",
+            "WebcastLikeMessage",
+            "WebcastChatMessage",
+        ] {
+            let mut msg = Vec::new();
+            put_bytes_field(&mut msg, 1, method.as_bytes());
+            put_bytes_field(&mut msg, 2, &payload);
+            put_bytes_field(&mut frame, 5, &msg);
+        }
+        frame
+    }
+
+    // ---------- 旧实现（HashMap + 拷贝），仅作为对比基线 ----------
+    enum LegacyValue {
+        Varint(u64),
+        Bytes(Vec<u8>),
+    }
+
+    fn legacy_parse(data: &[u8]) -> HashMap<u32, Vec<(u32, LegacyValue)>> {
+        let mut fields: HashMap<u32, Vec<(u32, LegacyValue)>> = HashMap::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let Some((tag, new_pos)) = read_varint(data, pos) else {
+                break;
+            };
+            pos = new_pos;
+            let field_number = (tag >> 3) as u32;
+            let wire_type = (tag & 7) as u32;
+            let value = match wire_type {
+                0 => {
+                    let Some((v, np)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = np;
+                    LegacyValue::Varint(v)
+                }
+                1 => {
+                    if pos + 8 > data.len() {
+                        break;
+                    }
+                    pos += 8;
+                    continue;
+                }
+                2 => {
+                    let Some((length, np)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = np;
+                    let len = length as usize;
+                    if pos + len > data.len() {
+                        break;
+                    }
+                    let val = LegacyValue::Bytes(data[pos..pos + len].to_vec());
+                    pos += len;
+                    val
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    pos += 4;
+                    continue;
+                }
+                _ => break,
+            };
+            fields.entry(field_number).or_default().push((wire_type, value));
+        }
+        fields
+    }
+
+    fn legacy_first_bytes(
+        fields: &HashMap<u32, Vec<(u32, LegacyValue)>>,
+        field: u32,
+    ) -> Option<Vec<u8>> {
+        fields.get(&field).and_then(|entries| {
+            entries.iter().find_map(|(wt, val)| match val {
+                LegacyValue::Bytes(b) if *wt == 2 => Some(b.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    fn legacy_decode_string(data: &[u8]) -> Option<String> {
+        let s = std::str::from_utf8(data).ok()?;
+        if s.chars().all(|c| c >= ' ' || c == '\n' || c == '\r' || c == '\t') {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn legacy_extract_user(user_bytes: &[u8]) -> (String, String) {
+        let fields = legacy_parse(user_bytes);
+        let user_id = fields
+            .get(&1)
+            .and_then(|e| {
+                e.iter().find_map(|(wt, v)| match v {
+                    LegacyValue::Varint(n) if *wt == 0 => Some(*n),
+                    _ => None,
+                })
+            })
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let nick_name = legacy_first_bytes(&fields, 3)
+            .and_then(|b| legacy_decode_string(&b))
+            .unwrap_or_default();
+        (nick_name, user_id)
+    }
+
+    fn legacy_extract_chat(payload: &[u8]) -> (String, String) {
+        let fields = legacy_parse(payload);
+        let content = legacy_first_bytes(&fields, 3)
+            .and_then(|b| legacy_decode_string(&b))
+            .unwrap_or_default();
+        let (nick_name, user_id) = match legacy_first_bytes(&fields, 2) {
+            Some(user_bytes) => legacy_extract_user(&user_bytes),
+            None => (String::new(), String::new()),
+        };
+        let user = if !nick_name.is_empty() {
+            nick_name
+        } else if !user_id.is_empty() {
+            user_id
+        } else {
+            "未知".to_string()
+        };
+        (user, content)
+    }
+
+    fn legacy_decode(frame: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let push_fields = legacy_parse(frame);
+        if let Some(entries) = push_fields.get(&5) {
+            for (_, val) in entries {
+                if let LegacyValue::Bytes(msg_bytes) = val {
+                    let msg_fields = legacy_parse(msg_bytes);
+                    let method = legacy_first_bytes(&msg_fields, 1)
+                        .and_then(|b| legacy_decode_string(&b))
+                        .unwrap_or_default();
+                    let payload = legacy_first_bytes(&msg_fields, 2).unwrap_or_default();
+                    if method == "WebcastChatMessage" {
+                        out.push(legacy_extract_chat(&payload));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // ---------- 新实现（扁平字段表 + 零拷贝） ----------
+    fn new_decode(frame: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let fields = parse_protobuf(frame);
+        for &(_, _, value) in fields.entries.iter().filter(|&&(f, _, _)| f == 5) {
+            if let PbValue::Bytes(msg_bytes) = value {
+                let msg_fields = parse_protobuf(msg_bytes);
+                let method = msg_fields.bytes(1).and_then(decode_string).unwrap_or_default();
+                let payload = msg_fields.bytes(2).unwrap_or(&[]);
+                if method == "WebcastChatMessage" {
+                    out.push(extract_chat_message(payload));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn protobuf_zero_copy_matches_legacy_and_is_faster() {
+        let frame = synthetic_frame();
+
+        // 1) 正确性：两种实现结果必须一致
+        assert_eq!(legacy_decode(&frame), new_decode(&frame));
+        assert_eq!(new_decode(&frame).len(), 2);
+
+        // 2) 性能对比（release 下数字更有意义）
+        let iterations = 50_000u32;
+        let t0 = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(legacy_decode(&frame));
+        }
+        let legacy = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(new_decode(&frame));
+        }
+        let new = t1.elapsed();
+
+        let legacy_fps = iterations as f64 / legacy.as_secs_f64();
+        let new_fps = iterations as f64 / new.as_secs_f64();
+        println!(
+            "帧解析吞吐：旧实现 {:.0} 帧/s，新实现 {:.0} 帧/s，加速 {:.2}x（{} 轮）",
+            legacy_fps,
+            new_fps,
+            new_fps / legacy_fps,
+            iterations
+        );
+
+        if !cfg!(debug_assertions) {
+            assert!(
+                new <= legacy,
+                "零拷贝解析不应慢于旧实现：new={:?} legacy={:?}",
+                new,
+                legacy
+            );
+        }
+    }
+}
