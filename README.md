@@ -34,6 +34,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 | `--edge-cookie` / `--edge` | 关闭 | 从本机 Edge 静默读取登录 Cookie |
 | `--poll-secs <秒>` | `10` | 未开播时的轮询间隔 |
 | `--max-retries <次数>` | `0`（无限） | 断线重连的最大次数，0 表示一直重连 |
+| `--verbose` / `-v` | 关闭 | 打印签名中间值（MD5、signature）等调试信息 |
 | `--ack` | 关闭 | 开启服务端 `needAck` 应答（实验性，见下文） |
 
 ## 输出说明

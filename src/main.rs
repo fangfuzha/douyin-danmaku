@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::{self, BufWriter, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use douyin_danmaku::browser_cookie;
 use douyin_danmaku::client;
@@ -13,6 +13,7 @@ use douyin_danmaku::sign;
 struct Out {
     w: BufWriter<io::Stdout>,
     pending: usize,
+    last_flush: Instant,
 }
 
 impl Out {
@@ -20,13 +21,16 @@ impl Out {
         Out {
             w: BufWriter::with_capacity(64 * 1024, io::stdout()),
             pending: 0,
+            last_flush: Instant::now(),
         }
     }
 
     fn line(&mut self, text: &str) {
         let _ = writeln!(self.w, "{}", text);
         self.pending += 1;
-        if self.pending >= 32 {
+        // 攒够 32 行或距上次刷新超过 300ms 就落盘：
+        // 既保证弹幕高峰时的批量写入，也让偶发的系统消息能及时看到。
+        if self.pending >= 32 || self.last_flush.elapsed() >= Duration::from_millis(300) {
             self.flush();
         }
     }
@@ -34,6 +38,7 @@ impl Out {
     fn flush(&mut self) {
         let _ = self.w.flush();
         self.pending = 0;
+        self.last_flush = Instant::now();
     }
 }
 
@@ -82,6 +87,8 @@ async fn main() -> Result<()> {
     let poll_secs = flag_value(&args, "--poll-secs").unwrap_or(10);
     // 最大重连次数，0 表示无限重连
     let max_retries = flag_value(&args, "--max-retries").unwrap_or(0);
+    // 是否打印签名等调试信息
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
 
     out.line("=== 纯 Rust 抖音弹幕采集器 ===");
     out.line(&format!("直播间: {}", web_rid));
@@ -145,7 +152,7 @@ async fn main() -> Result<()> {
 
         // (2) 每次连接都重新签名（签名参数含时间戳，重连后必须刷新）
         let (ws_url, cookies) =
-            match sign::build_ws_url(&room_id, &ttwid, extra_cookies.as_deref()).await {
+            match sign::build_ws_url(&room_id, &ttwid, extra_cookies.as_deref(), verbose).await {
                 Ok(v) => v,
                 Err(e) => {
                     cb(MessageType::System(format!("签名失败：{}；稍后重试", e)));

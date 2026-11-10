@@ -77,7 +77,12 @@ pub fn md5_hex(input: &str) -> String {
 
 /// 生成 WebSocket URL（纯 Rust，无需浏览器）
 /// extra_cookies: 额外的 cookie 字符串（如 sessionid 等），会与 ttwid 合并
-pub async fn build_ws_url(room_id: &str, ttwid: &str, extra_cookies: Option<&str>) -> Result<(String, String)> {
+pub async fn build_ws_url(
+    room_id: &str,
+    ttwid: &str,
+    extra_cookies: Option<&str>,
+    verbose: bool,
+) -> Result<(String, String)> {
     let did = generate_did();
     let timestamp = chrono::Utc::now().timestamp_millis();
 
@@ -95,7 +100,9 @@ pub async fn build_ws_url(room_id: &str, ttwid: &str, extra_cookies: Option<&str
 
     // 用 sign.js 生成 signature
     let signature = generate_signature(&md5_str)?;
-    println!("[签名] MD5={} -> signature={}", md5_str, signature);
+    if verbose {
+        println!("[签名] MD5={} -> signature={}", md5_str, signature);
+    }
 
     // 构建 internal_ext（与 Python 项目格式一致）
     let internal_ext = format!(
@@ -147,13 +154,13 @@ pub async fn build_ws_url(room_id: &str, ttwid: &str, extra_cookies: Option<&str
         .collect::<Vec<_>>()
         .join("&");
 
-    // Cookie 组合参考 BarrageGrab：ttwid + msToken + __ac_nonce
-    let mut cookies = format!(
-        "ttwid={}&msToken={}; __ac_nonce={}",
-        ttwid,
-        generate_ms_token(),
-        generate_ac_nonce()
-    );
+    // Cookie 只带 ttwid。
+    //
+    // 实测：握手带上 msToken/__ac_nonce 会被服务端拒绝（handshake-status: 417,
+    // handshake-msg: "not pass sign check"），与参考项目 saermart/DouyinLiveWebFetcher
+    // (liveMan.py) 及 BarrageGrab (cookie: ttwid={Ttwid}) 一致：
+    // msToken/__ac_nonce 只用于页面请求与 enter API，不用于 WebSocket 握手。
+    let mut cookies = format!("ttwid={}", ttwid);
     if let Some(extra) = extra_cookies {
         if !extra.is_empty() {
             cookies.push_str("; ");
