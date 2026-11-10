@@ -241,3 +241,20 @@ mod urlencoding {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_matches_known_vector() {
+        assert_eq!(md5_hex("abc123"), "e99a18c428cb38d5f260853678922e03");
+    }
+
+    /// 冒烟测试：确认 rquickjs 升级后 sign.js 仍可正常执行并产出签名
+    #[test]
+    fn signature_is_produced_by_quickjs() {
+        let signature = generate_signature("abc123").expect("签名生成失败");
+        assert!(!signature.is_empty(), "签名不应为空");
+    }
+}
