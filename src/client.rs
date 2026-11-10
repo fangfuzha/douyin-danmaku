@@ -9,6 +9,10 @@ use std::io::Read;
 use crate::config::WsSignConfig;
 use crate::models::MessageType;
 
+// ---------------------------------------------------------------------------
+// protobuf 读取（零拷贝：bytes 字段直接借用原始缓冲区）
+// ---------------------------------------------------------------------------
+
 fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -72,6 +76,20 @@ impl<'a> Fields<'a> {
         })
     }
 
+    /// 按字段号取出全部 bytes 字段（repeated）
+    #[inline]
+    fn bytes_all(&self, field: u32) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.entries.iter().filter_map(move |&(f, wt, v)| {
+            if f == field && wt == 2 {
+                match v {
+                    PbValue::Bytes(b) => Some(b),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
 }
 
 fn parse_protobuf<'a>(data: &'a [u8]) -> Fields<'a> {
@@ -128,6 +146,64 @@ fn parse_protobuf<'a>(data: &'a [u8]) -> Fields<'a> {
     Fields { entries }
 }
 
+// ---------------------------------------------------------------------------
+// protobuf 写入（仅用于回发 ack 帧）
+// ---------------------------------------------------------------------------
+
+fn write_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            break;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn write_varint_field(out: &mut Vec<u8>, field: u32, v: u64) {
+    write_varint(out, ((field as u64) << 3) | 0);
+    write_varint(out, v);
+}
+
+fn write_bytes_field(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+    write_varint(out, ((field as u64) << 3) | 2);
+    write_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+// ---------------------------------------------------------------------------
+// 帧结构
+//
+// 服务端下发的每一帧是一个 PushFrame（参考 BarrageGrab 的 Douyin.proto）：
+//   1 seqId / 2 logId / 7 payloadType / 8 payload
+// payload 通常是 gzip 压缩后的 Response：
+//   1 messagesList / 2 cursor / 5 internalExt / 8 heartbeatDuration / 9 needAck
+// ---------------------------------------------------------------------------
+
+const PUSHFRAME_SEQ_ID: u32 = 1;
+const PUSHFRAME_LOG_ID: u32 = 2;
+const PUSHFRAME_PAYLOAD_TYPE: u32 = 7;
+const PUSHFRAME_PAYLOAD: u32 = 8;
+
+const RESPONSE_MESSAGES: u32 = 1;
+const RESPONSE_HEARTBEAT_DURATION: u32 = 8;
+const RESPONSE_NEED_ACK: u32 = 9;
+
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// 一帧解析出来的会话状态
+struct FrameState {
+    /// 服务端指定的心跳间隔（秒），None 表示服务端没给
+    heartbeat_secs: Option<u64>,
+    /// 服务端要求回 ack
+    need_ack: bool,
+    /// 当前帧的 seqId / logId，用于构造 ack 帧
+    seq_id: u64,
+    log_id: u64,
+}
+
 /// 解码为 UTF-8 字符串（借用），仅接受可见字符。
 fn decode_string(data: &[u8]) -> Option<&str> {
     let s = std::str::from_utf8(data).ok()?;
@@ -136,6 +212,22 @@ fn decode_string(data: &[u8]) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// 构造 ack 确认帧：PushFrame { seqId, logId, payloadType = "ack" }
+fn build_ack_frame(seq_id: u64, log_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    write_varint_field(&mut out, PUSHFRAME_SEQ_ID, seq_id);
+    write_varint_field(&mut out, PUSHFRAME_LOG_ID, log_id);
+    write_bytes_field(&mut out, PUSHFRAME_PAYLOAD_TYPE, b"ack");
+    out
+}
+
+/// 把服务端给的心跳间隔换算成秒，并限制在合理范围内。
+/// 参考 Simple Live 的处理：服务端值可能被夹在 1~120 秒之间。
+fn normalize_heartbeat(raw: u64) -> u64 {
+    let secs = if raw > 120 { raw / 1000 } else { raw };
+    secs.clamp(1, 120)
 }
 
 fn extract_user(user_bytes: &[u8]) -> (String, String) {
@@ -315,15 +407,30 @@ fn extract_room_user_seq(payload: &[u8]) -> (String, u64) {
     (online, total)
 }
 
-pub struct DanmakuClient;
+pub struct DanmakuClient {
+    /// 是否回发 needAck 确认帧（协议实验特性，默认关闭）
+    send_ack: bool,
+}
 
 impl DanmakuClient {
     pub fn new() -> Self {
-        DanmakuClient
+        DanmakuClient { send_ack: false }
     }
 
-    /// 连接 WebSocket 并持续回调消息，返回接收到的消息条数。
-    pub async fn connect_with_sign<F>(&self, sign_config: &WsSignConfig, mut callback: F) -> Result<u64>
+    /// 开启 needAck 应答。
+    ///
+    /// 服务端在 Response.needAck 为 true 时会要求客户端回一个 payloadType="ack" 的帧。
+    /// 参考 Simple Live 的实现；BarrageGrab / DouyinLiveWebFetcher 不回 ack 也能正常工作，
+    /// 因此默认关闭，出现异常时可随时关掉。
+    pub fn with_ack(mut self, enable: bool) -> Self {
+        self.send_ack = enable;
+        self
+    }
+
+    /// 建立一次连接并持续接收消息，直到连接关闭或出错。
+    ///
+    /// 断线重连与未开播轮询由调用方（main.rs）根据返回的错误决定。
+    pub async fn connect_once<F>(&self, sign_config: &WsSignConfig, mut callback: F) -> Result<u64>
     where
         F: FnMut(MessageType) + Send,
     {
@@ -359,10 +466,19 @@ impl DanmakuClient {
 
         self.send_heartbeat(&mut ws_stream).await?;
 
-        let mut heartbeat_interval = time::interval(Duration::from_secs(10));
+        // 心跳间隔：默认 10 秒，服务端下发 heartbeatDuration 后按服务端给的来
+        let mut heartbeat_secs: u64 = 10;
+        let mut state = FrameState {
+            heartbeat_secs: None,
+            need_ack: false,
+            seq_id: 0,
+            log_id: 0,
+        };
         let mut msg_count = 0u64;
 
         loop {
+            // 用 sleep 而不是 interval，方便随时按服务端要求调整间隔
+            let sleep_for = Duration::from_secs(heartbeat_secs);
             tokio::select! {
                 msg = ws_stream.next() => {
                     match msg {
@@ -370,8 +486,22 @@ impl DanmakuClient {
                             // 整帧共用一个时间戳，避免每条消息都读一次系统时钟
                             let ts = chrono::Utc::now().timestamp();
                             let mut count = 0usize;
-                            self.handle_frame(&data, ts, &mut callback, &mut count);
+                            self.handle_frame(&data, ts, &mut callback, &mut count, &mut state);
                             msg_count += count as u64;
+
+                            // 服务端要求 ack 时回一帧
+                            if self.send_ack && state.need_ack {
+                                let ack = build_ack_frame(state.seq_id, state.log_id);
+                                if ws_stream.send(WsMessage::Binary(ack.into())).await.is_ok() {
+                                    state.need_ack = false;
+                                }
+                            }
+
+                            // 服务端指定的心跳间隔（限制在 1~120 秒）
+                            if let Some(hb) = state.heartbeat_secs {
+                                heartbeat_secs = hb;
+                                state.heartbeat_secs = None;
+                            }
                         }
                         Some(Ok(WsMessage::Text(text))) => {
                             callback(MessageType::System(format!("[文本消息] {}", text)));
@@ -387,20 +517,20 @@ impl DanmakuClient {
                             break;
                         }
                         Some(Err(e)) => {
-                            eprintln!("接收消息失败: {}", e);
-                            break;
+                            callback(MessageType::System(format!("接收消息失败: {}", e)));
+                            anyhow::bail!("接收消息失败: {}", e);
                         }
                         None => {
-                            eprintln!("WebSocket 连接已关闭");
-                            break;
+                            callback(MessageType::System("WebSocket 连接已关闭".to_string()));
+                            anyhow::bail!("WebSocket 连接已关闭");
                         }
                         _ => {}
                     }
                 }
-                _ = heartbeat_interval.tick() => {
+                _ = time::sleep(sleep_for) => {
                     if let Err(e) = self.send_heartbeat(&mut ws_stream).await {
-                        eprintln!("心跳发送失败: {}", e);
-                        break;
+                        callback(MessageType::System(format!("心跳发送失败: {}", e)));
+                        anyhow::bail!("心跳发送失败: {}", e);
                     }
                 }
             }
@@ -409,55 +539,72 @@ impl DanmakuClient {
         Ok(msg_count)
     }
 
-    /// 处理一帧数据：先处理 push 消息，再处理可能存在的 gzip（ack）消息。
-    /// 全程借用帧内缓冲，不复制负载。
+    /// 处理一帧数据。
+    ///
+    /// 帧结构：PushFrame { seqId=1, logId=2, payloadType=7, payload=8 }，
+    /// payload 是 gzip 压缩的 Response { messagesList=1, heartbeatDuration=8, needAck=9 }。
     fn handle_frame<F>(
         &self,
         data: &[u8],
         timestamp: i64,
         callback: &mut F,
         count: &mut usize,
+        state: &mut FrameState,
     ) where
         F: FnMut(MessageType),
     {
-        let push_fields = parse_protobuf(data);
+        let frame = parse_protobuf(data);
+        state.seq_id = frame.varint(PUSHFRAME_SEQ_ID).unwrap_or(state.seq_id);
+        state.log_id = frame.varint(PUSHFRAME_LOG_ID).unwrap_or(state.log_id);
 
-        for &(_, _, value) in push_fields.entries.iter().filter(|&&(f, _, _)| f == 5) {
-                if let PbValue::Bytes(msg_bytes) = value {
-                    let msg_fields = parse_protobuf(msg_bytes);
-                    let method = match msg_fields.bytes(1).and_then(decode_string) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    let payload = msg_fields.bytes(2).unwrap_or(&[]);
-                    *count += 1;
-                    if let Some(msg_type) = self.process_message(method, payload, timestamp) {
-                        callback(msg_type);
-                    }
-                }
+        // payload 正常在 PushFrame 的第 8 个字段；若取不到则回退到扫描 gzip magic
+        let payload: &[u8] = match frame.bytes(PUSHFRAME_PAYLOAD) {
+            Some(p) => p,
+            None => match data.windows(2).position(|w| w == GZIP_MAGIC) {
+                Some(idx) => &data[idx..],
+                // 既没有 payload 也不是 gzip：当作裸 Response 处理
+                None => data,
+            },
+        };
+
+        // payload 可能是 gzip 压缩的，也可能是明文 Response
+        let decompressed: Vec<u8>;
+        let response_bytes: &[u8] = if payload.starts_with(&GZIP_MAGIC) {
+            let mut buf = Vec::with_capacity(16 * 1024);
+            let mut decoder = GzDecoder::new(payload);
+            if decoder.read_to_end(&mut buf).is_err() {
+                return;
+            }
+            decompressed = buf;
+            &decompressed
+        } else {
+            payload
+        };
+
+        let response = parse_protobuf(response_bytes);
+
+        // 服务端指定的心跳间隔
+        if let Some(hb) = response.varint(RESPONSE_HEARTBEAT_DURATION) {
+            if hb > 0 {
+                state.heartbeat_secs = Some(normalize_heartbeat(hb));
+            }
+        }
+        // 服务端要求 ack
+        if response.varint(RESPONSE_NEED_ACK).unwrap_or(0) == 1 {
+            state.need_ack = true;
         }
 
-        // gzip（ack）负载：整帧扫描 magic，找到后解压并复用同一套解析逻辑
-        const MAGIC: [u8; 2] = [0x1f, 0x8b];
-        if let Some(idx) = data.windows(2).position(|w| w == MAGIC) {
-            let mut decompressed = Vec::with_capacity(16 * 1024);
-            let mut decoder = GzDecoder::new(&data[idx..]);
-            if decoder.read_to_end(&mut decompressed).is_ok() {
-                let resp_fields = parse_protobuf(&decompressed);
-                for &(_, _, value) in resp_fields.entries.iter().filter(|&&(f, _, _)| f == 1) {
-                    if let PbValue::Bytes(msg_bytes) = value {
-                        let msg_fields = parse_protobuf(msg_bytes);
-                        let method = match msg_fields.bytes(1).and_then(decode_string) {
-                            Some(m) => m,
-                            None => continue,
-                        };
-                        let payload = msg_fields.bytes(2).unwrap_or(&[]);
-                        *count += 1;
-                        if let Some(msg_type) = self.process_message(method, payload, timestamp) {
-                            callback(msg_type);
-                        }
-                    }
-                }
+        // messagesList：每条 Message { method=1, payload=2 }
+        for msg_bytes in response.bytes_all(RESPONSE_MESSAGES) {
+            let msg_fields = parse_protobuf(msg_bytes);
+            let method = match msg_fields.bytes(1).and_then(decode_string) {
+                Some(m) => m,
+                None => continue,
+            };
+            let payload = msg_fields.bytes(2).unwrap_or(&[]);
+            *count += 1;
+            if let Some(msg_type) = self.process_message(method, payload, timestamp) {
+                callback(msg_type);
             }
         }
     }
@@ -844,5 +991,126 @@ mod perf_tests {
                 legacy
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn put_bytes_field(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+        put_varint(out, ((field as u64) << 3) | 2);
+        put_varint(out, data.len() as u64);
+        out.extend_from_slice(data);
+    }
+
+    fn put_varint_field(out: &mut Vec<u8>, field: u32, v: u64) {
+        put_varint(out, (field as u64) << 3);
+        put_varint(out, v);
+    }
+
+    /// 构造一个 Response：messagesList + heartbeatDuration + needAck
+    fn build_response(heartbeat: u64, need_ack: bool) -> Vec<u8> {
+        let mut user = Vec::new();
+        put_varint_field(&mut user, 1, 998877);
+        put_bytes_field(&mut user, 3, "帧测试用户".as_bytes());
+
+        let mut payload = Vec::new();
+        put_bytes_field(&mut payload, 2, &user);
+        put_bytes_field(&mut payload, 3, "来自 PushFrame 的弹幕".as_bytes());
+
+        let mut message = Vec::new();
+        put_bytes_field(&mut message, 1, b"WebcastChatMessage");
+        put_bytes_field(&mut message, 2, &payload);
+
+        let mut response = Vec::new();
+        put_bytes_field(&mut response, RESPONSE_MESSAGES, &message);
+        put_varint_field(&mut response, RESPONSE_HEARTBEAT_DURATION, heartbeat);
+        if need_ack {
+            put_varint_field(&mut response, RESPONSE_NEED_ACK, 1);
+        }
+        response
+    }
+
+    /// 构造一个 PushFrame：payload 是 gzip 压缩后的 Response
+    fn build_push_frame(response: &[u8], seq_id: u64, log_id: u64) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(response).unwrap();
+        let gz = encoder.finish().unwrap();
+
+        let mut frame = Vec::new();
+        put_varint_field(&mut frame, PUSHFRAME_SEQ_ID, seq_id);
+        put_varint_field(&mut frame, PUSHFRAME_LOG_ID, log_id);
+        put_bytes_field(&mut frame, PUSHFRAME_PAYLOAD_TYPE, b"gzip");
+        put_bytes_field(&mut frame, PUSHFRAME_PAYLOAD, &gz);
+        frame
+    }
+
+    #[test]
+    fn frame_decoding_follows_pushframe_protocol() {
+        let response = build_response(15, true);
+        let frame = build_push_frame(&response, 42, 7);
+
+        let client = DanmakuClient::new();
+        let mut got: Vec<MessageType> = Vec::new();
+        let mut count = 0usize;
+        let mut state = FrameState {
+            heartbeat_secs: None,
+            need_ack: false,
+            seq_id: 0,
+            log_id: 0,
+        };
+
+        client.handle_frame(&frame, 100, &mut |m| got.push(m), &mut count, &mut state);
+
+        assert_eq!(count, 1, "应解析出 1 条消息");
+        assert_eq!(state.seq_id, 42);
+        assert_eq!(state.log_id, 7);
+        assert_eq!(state.heartbeat_secs, Some(15), "应读到服务端心跳间隔");
+        assert!(state.need_ack, "应读到 needAck 标记");
+
+        match &got[0] {
+            MessageType::Danmaku(msg) => {
+                assert_eq!(msg.content, "来自 PushFrame 的弹幕");
+                assert_eq!(msg.user_name, "帧测试用户");
+            }
+            other => panic!("期望弹幕消息，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ack_frame_carries_seq_and_type() {
+        let ack = build_ack_frame(42, 7);
+        let fields = parse_protobuf(&ack);
+        assert_eq!(fields.varint(PUSHFRAME_SEQ_ID), Some(42));
+        assert_eq!(fields.varint(PUSHFRAME_LOG_ID), Some(7));
+        assert_eq!(
+            fields.bytes(PUSHFRAME_PAYLOAD_TYPE),
+            Some(&b"ack"[..])
+        );
+    }
+
+    #[test]
+    fn heartbeat_duration_is_clamped() {
+        assert_eq!(normalize_heartbeat(10), 10);
+        assert_eq!(normalize_heartbeat(0), 1);
+        assert_eq!(normalize_heartbeat(500), 1); // 毫秒值换算后不足 1 秒，钳到 1 秒
+        assert_eq!(normalize_heartbeat(1000), 1);
+        assert_eq!(normalize_heartbeat(999999), 120); // 上限 120 秒
     }
 }

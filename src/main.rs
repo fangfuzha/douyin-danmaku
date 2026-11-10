@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use std::io::{self, BufWriter, Write};
+use std::time::Duration;
 
 use douyin_danmaku::browser_cookie;
 use douyin_danmaku::client;
 use douyin_danmaku::config;
+use douyin_danmaku::models::MessageType;
 use douyin_danmaku::sign;
 
 /// 带缓冲的标准输出：高频弹幕下每行一次 println! 会带来锁竞争与大量系统调用，
@@ -33,6 +35,14 @@ impl Out {
         let _ = self.w.flush();
         self.pending = 0;
     }
+}
+
+/// 断线重连的退避间隔：1s、2s、4s、8s、16s，之后封顶 30s。
+///
+/// 参考 jwwsjlm/douyinLive 的断线重连与 tiangalon/dy_danmaku_java 的重试间隔设计。
+fn backoff_secs(attempt: u32) -> u64 {
+    let exp = attempt.saturating_sub(1).min(5);
+    (1u64 << exp).min(30)
 }
 
 #[tokio::main]
@@ -66,6 +76,12 @@ async fn main() -> Result<()> {
     };
 
     let use_edge_cookie = args.iter().any(|a| a == "--edge-cookie" || a == "--edge");
+    // needAck 应答（协议实验特性，默认关闭）
+    let enable_ack = args.iter().any(|a| a == "--ack");
+    // 未开播时的轮询间隔（秒）
+    let poll_secs = flag_value(&args, "--poll-secs").unwrap_or(10);
+    // 最大重连次数，0 表示无限重连
+    let max_retries = flag_value(&args, "--max-retries").unwrap_or(0);
 
     out.line("=== 纯 Rust 抖音弹幕采集器 ===");
     out.line(&format!("直播间: {}", web_rid));
@@ -75,15 +91,9 @@ async fn main() -> Result<()> {
         out.line("身份: 游客");
     }
     out.line("");
-
-    let (ttwid, room_id) = sign::fetch_ttwid_and_room_id(&web_rid)
-        .await
-        .context("获取 ttwid 和 room_id 失败")?;
-    out.line(&format!("  ttwid: {}...", &ttwid[..20.min(ttwid.len())]));
-    out.line(&format!("  room_id: {}", room_id));
+    out.flush();
 
     let extra_cookies = if use_edge_cookie {
-        out.line("");
         out.line("正在从 Edge 浏览器静默获取登录 Cookie...");
         match browser_cookie::get_douyin_cookies_silent().await {
             Ok(cookies_str) => Some(cookies_str),
@@ -98,44 +108,99 @@ async fn main() -> Result<()> {
         None
     };
 
-    out.line("");
-    out.line("生成签名...");
-    let (ws_url, cookies) = sign::build_ws_url(&room_id, &ttwid, extra_cookies.as_deref())
-        .await
-        .context("生成签名失败")?;
+    let danmaku_client = client::DanmakuClient::new().with_ack(enable_ack);
 
-    out.line("");
-    out.line("连接 WebSocket...");
-    out.line("");
-    out.flush();
+    let mut ttwid = String::new();
+    let mut room_id = String::new();
+    let mut attempt: u32 = 0;
 
-    let sign_config = config::WsSignConfig {
-        ws_url,
-        signature: String::new(),
-        room_id: room_id.clone(),
-        ttwid,
-        ms_token: String::new(),
-        cookies,
+    // 所有输出统一经由回调，保证顺序
+    let mut cb = |msg: MessageType| {
+        out.line(&msg.to_string());
     };
 
-    let danmaku_client = client::DanmakuClient::new();
+    let msg_count = loop {
+        // (1) 获取房间信息：拿不到 room_id 通常意味着还没开播，按间隔轮询
+        if room_id.is_empty() {
+            match sign::fetch_ttwid_and_room_id(&web_rid).await {
+                Ok((t, r)) => {
+                    ttwid = t;
+                    room_id = r;
+                    cb(MessageType::System(format!(
+                        "  ttwid: {}...",
+                        &ttwid[..20.min(ttwid.len())]
+                    )));
+                    cb(MessageType::System(format!("  room_id: {}", room_id)));
+                }
+                Err(e) => {
+                    cb(MessageType::System(format!(
+                        "直播间未开播或信息获取失败：{}；{} 秒后重试",
+                        e, poll_secs
+                    )));
+                    tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                    continue;
+                }
+            }
+        }
 
-    out.line("开始接收弹幕...");
-    out.line("按 Ctrl+C 退出");
-    out.line("");
-    out.flush();
+        // (2) 每次连接都重新签名（签名参数含时间戳，重连后必须刷新）
+        let (ws_url, cookies) =
+            match sign::build_ws_url(&room_id, &ttwid, extra_cookies.as_deref()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    cb(MessageType::System(format!("签名失败：{}；稍后重试", e)));
+                    tokio::time::sleep(Duration::from_secs(backoff_secs(attempt.max(1)))).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
 
-    let msg_count = danmaku_client
-        .connect_with_sign(&sign_config, |msg| {
-            out.line(&msg.to_string());
-        })
-        .await
-        .context("WebSocket 连接失败")?;
+        let sign_config = config::WsSignConfig {
+            ws_url,
+            signature: String::new(),
+            room_id: room_id.clone(),
+            ttwid: ttwid.clone(),
+            ms_token: String::new(),
+            cookies,
+        };
+
+        // (3) 建立一次连接
+        match danmaku_client.connect_once(&sign_config, &mut cb).await {
+            Ok(n) => break n,
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                if max_retries > 0 && u64::from(attempt) >= max_retries {
+                    cb(MessageType::System(format!(
+                        "已达到最大重连次数（{}），退出",
+                        max_retries
+                    )));
+                    break 0;
+                }
+                let delay = backoff_secs(attempt);
+                cb(MessageType::System(format!(
+                    "连接中断：{}；{} 秒后进行第 {} 次重连",
+                    e, delay, attempt
+                )));
+                // 连续失败多次后重新拉取房间信息与 ttwid（可能已过期）
+                if attempt % 3 == 0 {
+                    room_id.clear();
+                    ttwid.clear();
+                }
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        }
+    };
 
     out.flush();
     out.line(&format!("共接收 {} 条消息", msg_count));
 
     Ok(())
+}
+
+/// 读取形如 --flag 30 的命令行参数值
+fn flag_value(args: &[String], name: &str) -> Option<u64> {
+    let idx = args.iter().position(|a| a == name)?;
+    args.get(idx + 1).and_then(|v| v.parse::<u64>().ok())
 }
 
 fn prompt(out: &mut Out, message: &str) -> Result<String> {
@@ -148,4 +213,32 @@ fn prompt(out: &mut Out, message: &str) -> Result<String> {
         .context("Failed to read input")?;
 
     Ok(input.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(backoff_secs(1), 1);
+        assert_eq!(backoff_secs(2), 2);
+        assert_eq!(backoff_secs(3), 4);
+        assert_eq!(backoff_secs(4), 8);
+        assert_eq!(backoff_secs(5), 16);
+        assert_eq!(backoff_secs(6), 30);
+        assert_eq!(backoff_secs(100), 30);
+    }
+
+    #[test]
+    fn flag_value_parses_next_argument() {
+        let args = vec![
+            "prog".to_string(),
+            "123456".to_string(),
+            "--poll-secs".to_string(),
+            "30".to_string(),
+        ];
+        assert_eq!(flag_value(&args, "--poll-secs"), Some(30));
+        assert_eq!(flag_value(&args, "--missing"), None);
+    }
 }
