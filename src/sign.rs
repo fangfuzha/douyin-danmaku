@@ -215,20 +215,30 @@ fn page_headers(cookie: Option<&str>) -> reqwest::header::HeaderMap {
 /// 同时响应头里的 ttwid 也只有约一半概率下发。
 /// 因此这里统一成一个重试循环：每次请求都尝试收集 ttwid 与 roomId，直到两者都拿到（最多 8 次）。
 pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> {
+    fetch_room_info(web_rid, None).await
+}
+
+/// 同上，但允许传入已缓存的 ttwid。
+///
+/// 服务端并非每次响应都下发 ttwid（实测有的整轮 8 次都拿不到），
+/// 因此 ttwid 一旦拿到就应当长期复用，只在彻底拿不到时才重新获取。
+pub async fn fetch_room_info(web_rid: &str, cached_ttwid: Option<&str>) -> Result<(String, String)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
+
         .build()?;
 
     // (1) ttwid 只能来自 live.douyin.com 页面响应的 Set-Cookie。
     //     实测：抖音的 ttwid 注册接口（ttwid.bytedance.com）虽然稳定返回 ttwid，
     //     但那是 bytedance/ixigua 域的值，带到 live.douyin.com 会一直拿到空壳页。
-    let mut ttwid = String::new();
+    let mut ttwid = cached_ttwid.unwrap_or("").to_string();
 
     let url = format!("https://live.douyin.com/{}", web_rid);
     let mut room_id = String::new();
     let mut last_err = String::new();
     let mut net_err = String::new();
+    let mut captcha = false;
 
     for attempt in 1..=8u32 {
         // 页面请求的 Cookie：只带 ttwid；还没拿到 ttwid 时干脆不带 Cookie。
@@ -258,6 +268,9 @@ pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> 
                     .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
                     .collect();
                 let body = resp.text().await.unwrap_or_default();
+                if body.contains("验证码") {
+                    captcha = true;
+                }
 
                 if ttwid.is_empty() {
                     ttwid = extract_ttwid(&set_cookies)
@@ -279,6 +292,8 @@ pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> 
 
         last_err = if !net_err.is_empty() {
             format!("请求直播间页面失败：{}", net_err)
+        } else if captcha {
+            "触发了抖音的验证码风控（返回验证码中间页）".to_string()
         } else if ttwid.is_empty() {
             "响应中未包含 ttwid".to_string()
         } else {
@@ -286,11 +301,92 @@ pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> 
         };
 
         if attempt < 8 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // 触发风控时放慢节奏：连续快速请求只会让验证码一直出现
+            let wait = if captcha { 5 } else { 2 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     }
 
     anyhow::bail!("未能获取直播间信息（已重试 8 次）：{}", last_err)
+}
+
+/// ttwid 本地缓存文件路径
+///
+/// ttwid 有效期很长（服务端下发的是 Expires 一年后的 cookie），
+/// 但每次访问直播间页面都可能触发抖音的验证码风控，
+/// 因此把它缓存下来，跨次运行直接复用，避免重复触发风控。
+fn ttwid_cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+        .or_else(|| std::env::var_os("HOME"))?;
+    Some(std::path::PathBuf::from(base).join("douyin-danmaku").join("ttwid.txt"))
+}
+
+/// 读取本地缓存的 ttwid
+pub fn load_cached_ttwid() -> Option<String> {
+    let path = ttwid_cache_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let t = content.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// 缓存 ttwid 到本地
+pub fn save_cached_ttwid(ttwid: &str) {
+    if let Some(path) = ttwid_cache_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, ttwid);
+    }
+}
+
+/// 删除本地缓存的 ttwid
+pub fn clear_cached_ttwid() {
+    if let Some(path) = ttwid_cache_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// room_id 本地缓存文件路径（room_id 是场次标识，开播期间保持不变）
+fn room_cache_path(web_rid: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+        .or_else(|| std::env::var_os("HOME"))?;
+    let safe: String = web_rid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    Some(
+        std::path::PathBuf::from(base)
+            .join("douyin-danmaku")
+            .join(format!("room_{}.txt", safe)),
+    )
+}
+
+/// 读取本地缓存的 room_id
+pub fn load_cached_room(web_rid: &str) -> Option<String> {
+    let path = room_cache_path(web_rid)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let r = content.trim().to_string();
+    if r.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// 缓存 room_id 到本地
+pub fn save_cached_room(web_rid: &str, room_id: &str) {
+    if let Some(path) = room_cache_path(web_rid) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, room_id);
+    }
 }
 
 /// 从 Set-Cookie 头列表中提取 ttwid 值

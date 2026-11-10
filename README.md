@@ -68,8 +68,9 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 - 它相当于匿名会话的"设备身份"：WebSocket 连接必须带上它，否则服务端会拒绝连接或把连接降权
 - 有效期由服务端控制（通常一天量级），过期后重新访问直播间页面即可拿到新的
 - 程序里它来自访问直播间页面时响应头的 `Set-Cookie`，并在每次运行时重新获取；断线重连多次后也会自动刷新
-- 服务端并非每次响应都下发 `ttwid`（实测约一半概率有），且直播间页面本身约三分之一概率只返回约 6KB 的空壳页（里面没有 `roomId`）。程序因此把"取 ttwid + 取 roomId"放在同一个重试循环里，最多重试 8 次（间隔 0.5 秒）
-- 请求直播间页面时**只带 `ttwid`**（还没有 ttwid 时不带任何 Cookie）。实测：带上 `msToken`（BarrageGrab 用的 107 位随机串）或 `__ac_nonce` 会让服务端几乎恒定返回空壳页，取不到 `roomId`；带任意 Cookie 时服务端也不再下发 `ttwid`
+- 服务端并非每次响应都下发 `ttwid`（实测约一半概率有），且直播间页面本身约三分之一概率只返回约 6KB 的**验证码中间页**（抖音风控，里面没有 `roomId`）。程序因此把"取 ttwid + 取 roomId"放在同一个重试循环里，最多重试 8 次（遇到验证码页时把间隔拉长到 5 秒，避免越试越被拦）
+- `ttwid` 与 `room_id` 会缓存在本地（`%LOCALAPPDATA%\douyin-danmaku\`），下一次运行直接复用，不再访问直播间页面，也就绕开了验证码风控；缓存的 `ttwid` 若被服务端判为失效（握手返回 `not pass sign check`），程序会自动清除并重新获取
+- 请求直播间页面时**只带 `ttwid`**（还没有 ttwid 时不带任何 Cookie）。实测：带上 `msToken`（BarrageGrab 用的 107 位随机串）或 `__ac_nonce` 时拿不到 `roomId`；带任意 Cookie 时服务端也不再下发 `ttwid`
 
 ### room_id
 
@@ -96,6 +97,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 | --- | --- | --- |
 | wss 直连、`internal_ext` 拼装、`identity=audience`、自取 `ttwid` | [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8）、[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像） | 抖音直播的连接参数拼装方式 |
 | 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 `BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto` | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
+| 抗风控：识别验证码中间页、放慢重试、缓存 `ttwid` / `room_id` | [lihuanpeng/DouyinBarrageGrab](https://github.com/lihuanpeng/DouyinBarrageGrab)（C#，MIT） | 实测抖音会对高频访问直播间页面的来源返回"验证码中间页"（约 6KB），本项目据此放慢重试并把 `ttwid`/`room_id` 缓存到本地，后续运行不再触碰页面 |
 | Cookie 只带 `ttwid`（页面请求与 WebSocket 握手都是） | BarrageGrab（`GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | **实测**：① 握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101）；② 页面请求带上 msToken 会让服务端几乎恒定返回空壳页（拿不到 `roomId`），因此本项目**未采用** BarrageGrab 的 msToken/`__ac_nonce` 组合（详见「已调研、暂未实现」） |
 | 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
 | protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
@@ -111,7 +113,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 
 | 能力 | 可借鉴的项目 | 说明 |
 | --- | --- | --- |
-| msToken / `__ac_nonce` Cookie 组合 | BarrageGrab（`GenerateMsToken`：107 位随机串；`__ac_nonce`：`0` + 20 位随机串） | **实测未采用**：页面请求带上 msToken 会让 live.douyin.com 几乎恒定返回空壳页（取不到 `roomId`），握手带上 msToken/`__ac_nonce` 则被拒（417 not pass sign check）。若将来抖音放开这两项，可直接照 BarrageGrab 补上 |
+| msToken / `__ac_nonce` Cookie 组合 | BarrageGrab（`GenerateMsToken`：107 位随机串；`__ac_nonce`：`0` + 20 位随机串） | **实测未采用**：页面请求带上 msToken 拿不到 `roomId`，握手带上 msToken/`__ac_nonce` 则被拒（417 not pass sign check）。若将来抖音放开这两项，可直接照 BarrageGrab 补上 |
 | IM 预取接口 | Simple Live 的协议拆解、jwwsjlm/douyinLive | 连接前先请求 `https://live.douyin.com/webcast/im/fetch/`，从响应里取 `pushServer` / `cursor` / `internalExt` / `heartbeatDuration`，比本项目硬编码 `webcast100-ws-web-lq` 域名与手工拼 `internal_ext` 更稳 |
 | 备用推送域名 | Simple Live、dyhub | 预生成 `webcast3/webcast5` 多组域名，连接失败自动切换并刷新上下文 |
 | 多房间并发 | jwwsjlm/douyinLive、dyhub | 每个房间独立任务与状态机，节点可横向扩容 |
@@ -125,6 +127,9 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 > 弹幕协议是抖音的私有协议，随时可能变。项目仅供学习研究使用，请遵守平台规则，不要用于商业或高频压测。
 
 ## 如何调试
+
+- 遇到「触发了抖音的验证码风控」：说明短时间内访问直播间页面太频繁。程序已经放慢重试并把 `ttwid`/`room_id` 缓存到本地，等几分钟再跑即可；想立刻重来可以删掉 `%LOCALAPPDATA%\douyin-danmaku\` 下的缓存
+- 遇到「`not pass sign check`」：说明服务端判定当前 `ttwid` 无效，程序会自动清掉缓存重新获取，无需手动处理
 
 - 跑测试（含签名冒烟、帧协议解析、protobuf 解析性能对比）：
 

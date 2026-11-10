@@ -117,8 +117,9 @@ async fn main() -> Result<()> {
 
     let danmaku_client = client::DanmakuClient::new().with_ack(enable_ack);
 
-    let mut ttwid = String::new();
-    let mut room_id = String::new();
+    // 优先复用本地缓存的 ttwid / room_id：避免重复访问直播间页面触发抖音验证码风控
+    let mut ttwid = sign::load_cached_ttwid().unwrap_or_default();
+    let mut room_id = sign::load_cached_room(&web_rid).unwrap_or_default();
     let mut attempt: u32 = 0;
 
     // 所有输出统一经由回调，保证顺序
@@ -129,9 +130,18 @@ async fn main() -> Result<()> {
     let msg_count = loop {
         // (1) 获取房间信息：拿不到 room_id 通常意味着还没开播，按间隔轮询
         if room_id.is_empty() {
-            match sign::fetch_ttwid_and_room_id(&web_rid).await {
+            // ttwid 一旦拿到就长期复用（服务端并非每次都下发），
+            // 这里把已缓存的 ttwid 传进去，只补齐缺失的 room_id。
+            let cached = if ttwid.is_empty() {
+                None
+            } else {
+                Some(ttwid.as_str())
+            };
+            match sign::fetch_room_info(&web_rid, cached).await {
                 Ok((t, r)) => {
                     ttwid = t;
+                    sign::save_cached_ttwid(&ttwid);
+                    sign::save_cached_room(&web_rid, &r);
                     room_id = r;
                     cb(MessageType::System(format!(
                         "  ttwid: {}...",
@@ -183,15 +193,23 @@ async fn main() -> Result<()> {
                     )));
                     break 0;
                 }
+                // 服务端明确说签名校验失败时，说明 ttwid 可能已失效，清掉缓存重来
+                let err_text = e.to_string();
+                if err_text.contains("not pass sign check") || err_text.contains("417") {
+                    ttwid.clear();
+                    sign::clear_cached_ttwid();
+                }
+
                 let delay = backoff_secs(attempt);
                 cb(MessageType::System(format!(
                     "连接中断：{}；{} 秒后进行第 {} 次重连",
                     e, delay, attempt
                 )));
-                // 连续失败多次后重新拉取房间信息与 ttwid（可能已过期）
+                // 连续失败多次后重新拉取房间信息（room_id 是场次标识，可能已变）。
+                // ttwid 不清空：它有效期很长，且服务端并非每次都下发，
+                // 清空后很可能再也拿不到（实测有整轮 8 次都拿不到的情况）。
                 if attempt % 3 == 0 {
                     room_id.clear();
-                    ttwid.clear();
                 }
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
