@@ -68,6 +68,8 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 - 它相当于匿名会话的"设备身份"：WebSocket 连接必须带上它，否则服务端会拒绝连接或把连接降权
 - 有效期由服务端控制（通常一天量级），过期后重新访问直播间页面即可拿到新的
 - 程序里它来自访问直播间页面时响应头的 `Set-Cookie`，并在每次运行时重新获取；断线重连多次后也会自动刷新
+- 服务端并非每次响应都下发 `ttwid`，因此程序取不到时会**自动重试最多 5 次**（间隔 0.5 秒），仍失败才报错退出
+- 页面请求的 Cookie 与 BarrageGrab 一致：`ttwid` + `msToken`（107 位随机串）+ `__ac_nonce`（`0` + 20 位随机串），拿到 ttwid 后再请求一次页面从 HTML 中提取 `roomId`
 
 ### room_id
 
@@ -94,7 +96,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 | --- | --- | --- |
 | wss 直连、`internal_ext` 拼装、`identity=audience`、自取 `ttwid` | [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8）、[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像） | 抖音直播的连接参数拼装方式 |
 | 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 `BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto` | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
-| Cookie 组合（`ttwid + msToken + __ac_nonce`） | BarrageGrab（`GenerateMsToken` / `GetTtwid` / `GetRoomId`） | msToken 为 107 位随机串，`__ac_nonce` 为 `0` + 20 位随机串 |
+| Cookie 分工：**页面请求**带 `ttwid + msToken + __ac_nonce`，**WebSocket 握手只带 `ttwid`** | BarrageGrab（`GenerateMsToken` / `GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | msToken 为 107 位随机串，`__ac_nonce` 为 `0` + 20 位随机串。**实测**：握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101） |
 | 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
 | protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
 | 心跳间隔跟随服务端 | [Simple Live 的协议拆解](https://blog.gitcode.com/0268abd9f86d85f8609446d3d803368e.html) | 服务端 `heartbeatDuration` 下发后按其心跳，客户端把间隔限制在 1~120 秒 |
