@@ -383,7 +383,7 @@ impl DanmakuClient {
                             callback(MessageType::System("[Pong]".to_string()));
                         }
                         Some(Ok(WsMessage::Close(msg))) => {
-                            println!("[Close] {:?}", msg);
+                            callback(MessageType::System(format!("[Close] {:?}", msg)));
                             break;
                         }
                         Some(Err(e)) => {
