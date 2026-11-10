@@ -63,21 +63,9 @@ async fn main() -> Result<()> {
         .cloned();
 
     let web_rid = match room_arg {
-        Some(arg) => {
-            if arg.starts_with("http") {
-                arg.trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&arg)
-                    .split('?')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                arg
-            }
-        }
-        None => prompt(&mut out, "请输入抖音直播间 web_rid: ")?,
+        Some(arg) => parse_web_rid(&arg),
+        // 交互输入同样要支持直接粘贴分享链接
+        None => parse_web_rid(&prompt(&mut out, "请输入抖音直播间 web_rid: ")?),
     };
 
     let use_edge_cookie = args.iter().any(|a| a == "--edge-cookie" || a == "--edge");
@@ -224,6 +212,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// 从用户输入里提取直播间的 web_rid（短号）。
+///
+/// 支持三种写法：纯短号（587795807816）、直播间链接
+/// （https://live.douyin.com/587795807816）、带查询串的分享链接
+/// （https://live.douyin.com/587795807816?enter_from=...）。
+fn parse_web_rid(input: &str) -> String {
+    // 去掉首尾空白，以及管道/重定向输入可能带上的 UTF-8 BOM（U+FEFF）与零宽字符
+    let s = input
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .trim_start_matches('\u{200b}')
+        .trim();
+    if !s.starts_with("http") {
+        return s.to_string();
+    }
+    // 取路径最后一段，再去掉 ?query 与 #fragment
+    let path = s
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or("").to_string()
+}
+
 /// 读取形如 --flag 30 的命令行参数值
 fn flag_value(args: &[String], name: &str) -> Option<u64> {
     let idx = args.iter().position(|a| a == name)?;
@@ -255,6 +267,29 @@ mod tests {
         assert_eq!(backoff_secs(5), 16);
         assert_eq!(backoff_secs(6), 30);
         assert_eq!(backoff_secs(100), 30);
+    }
+
+    #[test]
+    fn parse_web_rid_accepts_plain_id_and_links() {
+        assert_eq!(parse_web_rid("587795807816"), "587795807816");
+        assert_eq!(
+            parse_web_rid("https://live.douyin.com/587795807816"),
+            "587795807816"
+        );
+        assert_eq!(
+            parse_web_rid("https://live.douyin.com/587795807816?enter_from=x"),
+            "587795807816"
+        );
+        assert_eq!(
+            parse_web_rid("https://live.douyin.com/587795807816/"),
+            "587795807816"
+        );
+        assert_eq!(parse_web_rid("  587795807816  "), "587795807816");
+        // 管道输入可能带 UTF-8 BOM
+        assert_eq!(
+            parse_web_rid("\u{feff}https://live.douyin.com/587795807816"),
+            "587795807816"
+        );
     }
 
     #[test]
