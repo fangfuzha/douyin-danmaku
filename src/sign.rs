@@ -43,6 +43,27 @@ pub fn generate_signature(md5_param: &str) -> Result<String> {
     Ok(result)
 }
 
+/// 生成随机 token（msToken / __ac_nonce）。
+///
+/// 参考 BarrageGrab 的 GenerateMsToken：字符集为大小写字母 + 数字 + "=_"。
+pub fn random_token(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=_";
+    let mut rng = rand::rng();
+    (0..len)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+/// 生成 msToken（默认 107 位），参考 BarrageGrab
+pub fn generate_ms_token() -> String {
+    random_token(107)
+}
+
+/// 生成 __ac_nonce，参考 BarrageGrab：固定以 "0" 开头 + 20 位随机串
+pub fn generate_ac_nonce() -> String {
+    format!("0{}", random_token(20))
+}
+
 /// 计算 MD5 hex（32位小写）
 pub fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
@@ -126,15 +147,19 @@ pub async fn build_ws_url(room_id: &str, ttwid: &str, extra_cookies: Option<&str
         .collect::<Vec<_>>()
         .join("&");
 
-    let cookies = if let Some(extra) = extra_cookies {
-        if extra.is_empty() {
-            format!("ttwid={}", ttwid)
-        } else {
-            format!("ttwid={}; {}", ttwid, extra)
+    // Cookie 组合参考 BarrageGrab：ttwid + msToken + __ac_nonce
+    let mut cookies = format!(
+        "ttwid={}&msToken={}; __ac_nonce={}",
+        ttwid,
+        generate_ms_token(),
+        generate_ac_nonce()
+    );
+    if let Some(extra) = extra_cookies {
+        if !extra.is_empty() {
+            cookies.push_str("; ");
+            cookies.push_str(extra);
         }
-    } else {
-        format!("ttwid={}", ttwid)
-    };
+    }
 
     // 使用 Python 项目相同的服务器域名
     let ws_url = format!(
@@ -156,6 +181,8 @@ pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> 
     let resp = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0")
+        // 参考 BarrageGrab：访问直播间页面时带上 __ac_nonce
+        .header("cookie", &format!("__ac_nonce={}", generate_ac_nonce()))
         .send()
         .await
         .context("Failed to fetch live page")?;
