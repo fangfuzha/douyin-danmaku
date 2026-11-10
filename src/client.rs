@@ -28,21 +28,58 @@ fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     None
 }
 
-#[derive(Debug, Clone)]
-enum PbValue {
+/// protobuf 字段值。Bytes 直接借用原始缓冲区，避免每条消息复制一遍负载。
+#[derive(Debug, Clone, Copy)]
+enum PbValue<'a> {
     Varint(u64),
-    Bytes(Vec<u8>),
-    Fixed64(()),
-    Fixed32(()),
+    Bytes(&'a [u8]),
+    Fixed64,
+    Fixed32,
 }
 
-fn parse_protobuf(data: &[u8]) -> std::collections::HashMap<u32, Vec<(u32, PbValue)>> {
-    let mut fields: std::collections::HashMap<u32, Vec<(u32, PbValue)>> = std::collections::HashMap::new();
-    let mut pos = 0;
+/// 解析后的 protobuf 字段集合：扁平存放 (字段号, wire type, 值)。
+/// 字段数量很少，线性查找比 HashMap 更快，且省掉哈希表与多层 Vec 的分配。
+struct Fields<'a> {
+    entries: Vec<(u32, u32, PbValue<'a>)>,
+}
+
+impl<'a> Fields<'a> {
+    #[inline]
+    fn bytes(&self, field: u32) -> Option<&'a [u8]> {
+        self.entries.iter().find_map(|&(f, wt, v)| {
+            if f == field && wt == 2 {
+                match v {
+                    PbValue::Bytes(b) => Some(b),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[inline]
+    fn varint(&self, field: u32) -> Option<u64> {
+        self.entries.iter().find_map(|&(f, wt, v)| {
+            if f == field && wt == 0 {
+                match v {
+                    PbValue::Varint(n) => Some(n),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+}
+
+fn parse_protobuf<'a>(data: &'a [u8]) -> Fields<'a> {
+    let mut entries = Vec::with_capacity(8);
+    let mut pos = 0usize;
     while pos < data.len() {
-        let (tag, new_pos) = match read_varint(data, pos) {
-            Some(v) => v,
-            None => break,
+        let Some((tag, new_pos)) = read_varint(data, pos) else {
+            break;
         };
         pos = new_pos;
         let field_number = (tag >> 3) as u32;
@@ -50,114 +87,79 @@ fn parse_protobuf(data: &[u8]) -> std::collections::HashMap<u32, Vec<(u32, PbVal
 
         let value = match wire_type {
             0 => {
-                match read_varint(data, pos) {
-                    Some((v, np)) => {
-                        pos = np;
-                        PbValue::Varint(v)
-                    }
-                    None => break,
-                }
+                let Some((v, np)) = read_varint(data, pos) else {
+                    break;
+                };
+                pos = np;
+                PbValue::Varint(v)
             }
             1 => {
                 if pos + 8 > data.len() {
                     break;
                 }
                 pos += 8;
-                PbValue::Fixed64(())
+                PbValue::Fixed64
             }
             2 => {
-                let (length, np) = match read_varint(data, pos) {
-                    Some(v) => v,
-                    None => break,
+                let Some((length, np)) = read_varint(data, pos) else {
+                    break;
                 };
                 pos = np;
                 let len = length as usize;
                 if pos + len > data.len() {
                     break;
                 }
-                let val = PbValue::Bytes(data[pos..pos + len].to_vec());
+                let val = &data[pos..pos + len];
                 pos += len;
-                val
+                PbValue::Bytes(val)
             }
             5 => {
                 if pos + 4 > data.len() {
                     break;
                 }
                 pos += 4;
-                PbValue::Fixed32(())
+                PbValue::Fixed32
             }
             _ => break,
         };
 
-        fields.entry(field_number).or_insert_with(Vec::new).push((wire_type, value));
+        entries.push((field_number, wire_type, value));
     }
-    fields
+    Fields { entries }
 }
 
-fn try_decode_string(data: &[u8]) -> Option<String> {
-    match std::str::from_utf8(data) {
-        Ok(s) => {
-            if s.chars().all(|c| c >= ' ' || c == '\n' || c == '\r' || c == '\t') {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
+/// 解码为 UTF-8 字符串（借用），仅接受可见字符。
+fn decode_string(data: &[u8]) -> Option<&str> {
+    let s = std::str::from_utf8(data).ok()?;
+    if s.chars().all(|c| c >= ' ' || c == '\n' || c == '\r' || c == '\t') {
+        Some(s)
+    } else {
+        None
     }
-}
-
-fn get_first_bytes(fields: &std::collections::HashMap<u32, Vec<(u32, PbValue)>>, field: u32) -> Option<Vec<u8>> {
-    fields.get(&field).and_then(|entries| {
-        entries.iter().find_map(|(wt, val)| {
-            if *wt == 2 {
-                if let PbValue::Bytes(b) = val {
-                    Some(b.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-    })
-}
-
-fn get_first_varint(fields: &std::collections::HashMap<u32, Vec<(u32, PbValue)>>, field: u32) -> Option<u64> {
-    fields.get(&field).and_then(|entries| {
-        entries.iter().find_map(|(wt, val)| {
-            if *wt == 0 {
-                if let PbValue::Varint(v) = val {
-                    Some(*v)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-    })
 }
 
 fn extract_user(user_bytes: &[u8]) -> (String, String) {
     let fields = parse_protobuf(user_bytes);
-    let user_id = get_first_varint(&fields, 1).map(|v| v.to_string()).unwrap_or_default();
-    let nick_name = get_first_bytes(&fields, 3)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
+    let user_id = fields.varint(1).map(|v| v.to_string()).unwrap_or_default();
+    let nick_name = fields
+        .bytes(3)
+        .and_then(decode_string)
+        .unwrap_or_default()
+        .to_owned();
     (nick_name, user_id)
 }
 
 fn extract_chat_message(payload: &[u8]) -> (String, String) {
     let fields = parse_protobuf(payload);
-    let content = get_first_bytes(&fields, 3)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
+    let content = fields
+        .bytes(3)
+        .and_then(decode_string)
+        .unwrap_or_default()
+        .to_owned();
 
-    let (nick_name, user_id) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let (nick_name, user_id) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
 
     let user = if !nick_name.is_empty() {
@@ -172,148 +174,107 @@ fn extract_chat_message(payload: &[u8]) -> (String, String) {
 
 fn extract_member_message(payload: &[u8]) -> (String, u64) {
     let fields = parse_protobuf(payload);
-    let member_count = get_first_varint(&fields, 3).unwrap_or(0);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let member_count = fields.varint(3).unwrap_or(0);
+    let (nick_name, _) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
     (nick_name, member_count)
 }
 
 fn extract_gift_message(payload: &[u8]) -> (String, String, u64) {
     let fields = parse_protobuf(payload);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let (nick_name, _) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
-    let gift_name = get_first_bytes(&fields, 3)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
-    let gift_count = get_first_varint(&fields, 4).unwrap_or(1);
+    let gift_name = fields
+        .bytes(3)
+        .and_then(decode_string)
+        .unwrap_or_default()
+        .to_owned();
+    let gift_count = fields.varint(4).unwrap_or(1);
     (nick_name, gift_name, gift_count)
 }
 
 fn extract_like_message(payload: &[u8]) -> (String, u64) {
     let fields = parse_protobuf(payload);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let (nick_name, _) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
-    let like_count = get_first_varint(&fields, 3).unwrap_or(1);
+    let like_count = fields.varint(3).unwrap_or(1);
     (nick_name, like_count)
 }
 
 fn extract_lottery_message(payload: &[u8]) -> Option<String> {
     let fields = parse_protobuf(payload);
-    if let Some(common_bytes) = get_first_bytes(&fields, 1) {
-        let common_fields = parse_protobuf(&common_bytes);
-        if let Some(status) = get_first_varint(&common_fields, 14) {
-            if status == 2 {
-                if let Some(desc_bytes) = get_first_bytes(&fields, 3) {
-                    if let Some(desc) = try_decode_string(&desc_bytes) {
-                        return Some(desc);
-                    }
-                }
-            }
-        }
+    let common_bytes = fields.bytes(1)?;
+    let common_fields = parse_protobuf(common_bytes);
+    if common_fields.varint(14) != Some(2) {
+        return None;
     }
-    None
+    fields
+        .bytes(3)
+        .and_then(decode_string)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
 }
 
 /// 解析社交消息（关注、分享等）
 fn extract_social_message(payload: &[u8]) -> (String, String) {
     let fields = parse_protobuf(payload);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let (nick_name, _) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
     // 字段 1 是 CommonTextMessage，其中字段 2 是内容
-    let action = if let Some(common_bytes) = get_first_bytes(&fields, 1) {
-        let common_fields = parse_protobuf(&common_bytes);
-        get_first_bytes(&common_fields, 2)
-            .and_then(|b| try_decode_string(&b))
-            .unwrap_or_default()
+    let action = fields
+        .bytes(1)
+        .map(|common_bytes| {
+            let common_fields = parse_protobuf(common_bytes);
+            common_fields
+                .bytes(2)
+                .and_then(decode_string)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let action = if action.is_empty() {
+        "分享了直播间".to_string()
     } else {
-        String::new()
+        action
     };
-    let action = if action.is_empty() { "分享了直播间".to_string() } else { action };
     (nick_name, action)
 }
 
 /// 解析粉丝团消息
 fn extract_fansclub_message(payload: &[u8]) -> (String, String, i32, String) {
     let fields = parse_protobuf(payload);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
+    let (nick_name, _) = match fields.bytes(2) {
+        Some(user_bytes) => extract_user(user_bytes),
+        None => (String::new(), String::new()),
     };
-    // 粉丝团名称和等级通常在嵌套消息中
-    let club_name = if let Some(club_bytes) = get_first_bytes(&fields, 1) {
-        let club_fields = parse_protobuf(&club_bytes);
-        get_first_bytes(&club_fields, 1)
-            .and_then(|b| try_decode_string(&b))
-            .unwrap_or_default()
-    } else {
-        String::new()
+    // 粉丝团名称和等级位于同一个嵌套消息里，只解析一次
+    let (club_name, level) = match fields.bytes(1) {
+        Some(club_bytes) => {
+            let club_fields = parse_protobuf(club_bytes);
+            let name = club_fields
+                .bytes(1)
+                .and_then(decode_string)
+                .unwrap_or_default()
+                .to_owned();
+            let level = club_fields.varint(2).unwrap_or(0) as i32;
+            (name, level)
+        }
+        None => (String::new(), 0),
     };
-    let level = if let Some(club_bytes) = get_first_bytes(&fields, 1) {
-        let club_fields = parse_protobuf(&club_bytes);
-        get_first_varint(&club_fields, 2).map(|v| v as i32).unwrap_or(0)
-    } else {
-        0
+    let action = match fields.varint(3) {
+        Some(1) => "加入了粉丝团".to_string(),
+        Some(2) => "升级了粉丝团".to_string(),
+        _ => "粉丝团变动".to_string(),
     };
-    let action = get_first_varint(&fields, 3)
-        .map(|v| match v {
-            1 => "加入了粉丝团".to_string(),
-            2 => "升级了粉丝团".to_string(),
-            _ => "粉丝团变动".to_string(),
-        })
-        .unwrap_or_else(|| "粉丝团变动".to_string());
     (nick_name, club_name, level, action)
-}
-
-/// 解析房间排行消息
-fn extract_room_rank_message(payload: &[u8]) -> String {
-    let fields = parse_protobuf(payload);
-    let count = fields.get(&2).map(|v| v.len()).unwrap_or(0)
-        + fields.get(&3).map(|v| v.len()).unwrap_or(0);
-    if count > 0 {
-        format!("排行榜更新（共{}位上榜）", count)
-    } else {
-        String::new()
-    }
-}
-
-/// 解析房间统计详情消息
-fn extract_room_stats_detail(payload: &[u8]) -> (String, String, String) {
-    let fields = parse_protobuf(payload);
-    let display_short = get_first_bytes(&fields, 2)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
-    let display_middle = get_first_bytes(&fields, 3)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
-    let display_long = get_first_bytes(&fields, 4)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
-    (display_short, display_middle, display_long)
-}
-
-/// 解析弹幕点赞消息
-fn extract_chat_like_message(payload: &[u8]) -> (String, i64) {
-    let fields = parse_protobuf(payload);
-    let (nick_name, _) = if let Some(user_bytes) = get_first_bytes(&fields, 2) {
-        extract_user(&user_bytes)
-    } else {
-        (String::new(), String::new())
-    };
-    let like_count = get_first_varint(&fields, 3).unwrap_or(1) as i64;
-    (nick_name, like_count)
 }
 
 /// 解析热门弹幕消息
@@ -321,19 +282,19 @@ fn extract_hot_chat_message(payload: &[u8]) -> String {
     let fields = parse_protobuf(payload);
     // 尝试从嵌套结构中提取内容
     for field_num in [1, 2, 3] {
-        if let Some(b) = get_first_bytes(&fields, field_num) {
-            if let Some(s) = try_decode_string(&b) {
+        if let Some(b) = fields.bytes(field_num) {
+            if let Some(s) = decode_string(b) {
                 if !s.is_empty() {
-                    return s;
+                    return s.to_owned();
                 }
             }
             // 尝试嵌套解析
-            let sub_fields = parse_protobuf(&b);
+            let sub_fields = parse_protobuf(b);
             for sub_field in [1, 2, 3] {
-                if let Some(sb) = get_first_bytes(&sub_fields, sub_field) {
-                    if let Some(s) = try_decode_string(&sb) {
+                if let Some(sb) = sub_fields.bytes(sub_field) {
+                    if let Some(s) = decode_string(sb) {
                         if !s.is_empty() {
-                            return s;
+                            return s.to_owned();
                         }
                     }
                 }
@@ -345,61 +306,13 @@ fn extract_hot_chat_message(payload: &[u8]) -> String {
 
 fn extract_room_user_seq(payload: &[u8]) -> (String, u64) {
     let fields = parse_protobuf(payload);
-    let online = get_first_bytes(&fields, 10)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_else(|| "0".to_string());
-    let total = get_first_varint(&fields, 3).unwrap_or(0);
+    let online = fields
+        .bytes(10)
+        .and_then(decode_string)
+        .unwrap_or("0")
+        .to_owned();
+    let total = fields.varint(3).unwrap_or(0);
     (online, total)
-}
-
-fn extract_method_payload(msg_bytes: &[u8]) -> Option<(String, Vec<u8>)> {
-    let msg_fields = parse_protobuf(msg_bytes);
-    let method = get_first_bytes(&msg_fields, 1)
-        .and_then(|b| try_decode_string(&b))
-        .unwrap_or_default();
-    let payload = get_first_bytes(&msg_fields, 2).unwrap_or_default();
-    if method.is_empty() {
-        None
-    } else {
-        Some((method, payload))
-    }
-}
-
-fn decode_ws_frame(data: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let mut messages = Vec::new();
-
-    let push_fields = parse_protobuf(data);
-
-    if let Some(entries) = push_fields.get(&5) {
-        for (_, val) in entries {
-            if let PbValue::Bytes(msg_bytes) = val {
-                if let Some(mp) = extract_method_payload(msg_bytes) {
-                    messages.push(mp);
-                }
-            }
-        }
-    }
-
-    let magic_bytes = [0x1f, 0x8b];
-    if let Some(idx) = data.windows(2).position(|w| w == magic_bytes) {
-        let raw = &data[idx..];
-        let mut decoder = GzDecoder::new(raw);
-        let mut decompressed = Vec::new();
-        if decoder.read_to_end(&mut decompressed).is_ok() {
-            let resp_fields = parse_protobuf(&decompressed);
-            if let Some(entries) = resp_fields.get(&1) {
-                for (_, val) in entries {
-                    if let PbValue::Bytes(msg_bytes) = val {
-                        if let Some(mp) = extract_method_payload(msg_bytes) {
-                            messages.push(mp);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    messages
 }
 
 pub struct DanmakuClient;
@@ -448,13 +361,11 @@ impl DanmakuClient {
                 msg = ws_stream.next() => {
                     match msg {
                         Some(Ok(WsMessage::Binary(data))) => {
-                            let messages = decode_ws_frame(&data);
-                            for (method, payload) in messages {
-                                msg_count += 1;
-                                if let Some(msg_type) = self.process_message(&method, &payload) {
-                                    callback(msg_type);
-                                }
-                            }
+                            // 整帧共用一个时间戳，避免每条消息都读一次系统时钟
+                            let ts = chrono::Utc::now().timestamp();
+                            let mut count = 0usize;
+                            self.handle_frame(&data, ts, &mut callback, &mut count);
+                            msg_count += count as u64;
                         }
                         Some(Ok(WsMessage::Text(text))) => {
                             println!("[文本消息] {}", text);
@@ -493,19 +404,72 @@ impl DanmakuClient {
         Ok(())
     }
 
+    /// 处理一帧数据：先处理 push 消息，再处理可能存在的 gzip（ack）消息。
+    /// 全程借用帧内缓冲，不复制负载。
+    fn handle_frame<F>(
+        &self,
+        data: &[u8],
+        timestamp: i64,
+        callback: &mut F,
+        count: &mut usize,
+    ) where
+        F: FnMut(MessageType),
+    {
+        let push_fields = parse_protobuf(data);
+
+        for &(_, _, value) in push_fields.entries.iter().filter(|&&(f, _, _)| f == 5) {
+                if let PbValue::Bytes(msg_bytes) = value {
+                    let msg_fields = parse_protobuf(msg_bytes);
+                    let method = match msg_fields.bytes(1).and_then(decode_string) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let payload = msg_fields.bytes(2).unwrap_or(&[]);
+                    *count += 1;
+                    if let Some(msg_type) = self.process_message(method, payload, timestamp) {
+                        callback(msg_type);
+                    }
+                }
+        }
+
+        // gzip（ack）负载：整帧扫描 magic，找到后解压并复用同一套解析逻辑
+        const MAGIC: [u8; 2] = [0x1f, 0x8b];
+        if let Some(idx) = data.windows(2).position(|w| w == MAGIC) {
+            let mut decompressed = Vec::with_capacity(16 * 1024);
+            let mut decoder = GzDecoder::new(&data[idx..]);
+            if decoder.read_to_end(&mut decompressed).is_ok() {
+                let resp_fields = parse_protobuf(&decompressed);
+                for &(_, _, value) in resp_fields.entries.iter().filter(|&&(f, _, _)| f == 1) {
+                    if let PbValue::Bytes(msg_bytes) = value {
+                        let msg_fields = parse_protobuf(msg_bytes);
+                        let method = match msg_fields.bytes(1).and_then(decode_string) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+                        let payload = msg_fields.bytes(2).unwrap_or(&[]);
+                        *count += 1;
+                        if let Some(msg_type) = self.process_message(method, payload, timestamp) {
+                            callback(msg_type);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn send_heartbeat(
         &self,
         ws_stream: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> Result<()> {
-        let heartbeat = [0x3a, 0x02, 0x68, 0x62];
-        let message = WsMessage::Binary(heartbeat.to_vec().into());
+        const HEARTBEAT: [u8; 4] = [0x3a, 0x02, 0x68, 0x62];
+        let message = WsMessage::Binary(HEARTBEAT.to_vec().into());
         ws_stream.send(message).await.context("Failed to send heartbeat")?;
         Ok(())
     }
 
-    fn process_message(&self, method: &str, payload: &[u8]) -> Option<MessageType> {
+    fn process_message(&self, method: &str, payload: &[u8], timestamp: i64) -> Option<MessageType> {
         match method {
             "WebcastChatMessage" | "WebcastAudioChatMessage" => {
                 let (user, content) = extract_chat_message(payload);
@@ -514,7 +478,7 @@ impl DanmakuClient {
                         user_id: String::new(),
                         user_name: user,
                         content,
-                        timestamp: chrono::Utc::now().timestamp(),
+                        timestamp,
                         user_level: None,
                         user_medal: None,
                     }))
@@ -527,7 +491,7 @@ impl DanmakuClient {
                 Some(MessageType::Enter(crate::models::EnterMessage {
                     user_id: String::new(),
                     user_name: user,
-                    timestamp: chrono::Utc::now().timestamp(),
+                    timestamp,
                 }))
             }
             "WebcastRoomUserSeqMessage" => {
@@ -537,7 +501,7 @@ impl DanmakuClient {
                     viewer_count,
                     like_count: 0,
                     gift_count: 0,
-                    timestamp: chrono::Utc::now().timestamp(),
+                    timestamp,
                 }))
             }
             "WebcastGiftMessage" => {
@@ -549,7 +513,7 @@ impl DanmakuClient {
                         gift_name,
                         gift_count: gift_count as i64,
                         gift_price: None,
-                        timestamp: chrono::Utc::now().timestamp(),
+                        timestamp,
                     }))
                 } else {
                     None
@@ -561,7 +525,7 @@ impl DanmakuClient {
                     user_id: String::new(),
                     user_name: user,
                     like_count: like_count as i64,
-                    timestamp: chrono::Utc::now().timestamp(),
+                    timestamp,
                 }))
             }
             "WebcastLotteryMessage" => {
@@ -577,10 +541,8 @@ impl DanmakuClient {
             }
             "WebcastControlMessage" => {
                 let fields = parse_protobuf(payload);
-                if let Some(val) = get_first_varint(&fields, 2) {
-                    if val == 3 {
-                        println!("[系统消息] 直播已结束");
-                    }
+                if fields.varint(2) == Some(3) {
+                    println!("[系统消息] 直播已结束");
                 }
                 None
             }
@@ -590,7 +552,7 @@ impl DanmakuClient {
                     Some(MessageType::Social(crate::models::SocialMessage {
                         user_name: user,
                         action,
-                        timestamp: chrono::Utc::now().timestamp(),
+                        timestamp,
                     }))
                 } else {
                     None
@@ -604,41 +566,27 @@ impl DanmakuClient {
                         club_name,
                         level,
                         action,
-                        timestamp: chrono::Utc::now().timestamp(),
+                        timestamp,
                     }))
                 } else {
                     None
                 }
             }
-            "WebcastRoomRankMessage" => {
-                // 排行榜更新频率高、信息密度低，默认不输出
-                let _ = extract_room_rank_message(payload);
-                None
-            }
-            "WebcastRoomStatsMessage" => {
-                // 房间统计详情更新频率高、与 RoomUserSeqMessage 重复，默认不输出
-                let _ = extract_room_stats_detail(payload);
-                None
-            }
-            "WebcastChatLikeMessage" => {
-                // 弹幕点赞刷屏严重，默认不输出
-                let _ = extract_chat_like_message(payload);
-                None
-            }
+            // 以下三类消息更新频率高、信息密度低，默认不输出：
+            // 直接跳过解析，避免为丢弃的消息白白付出 protobuf 解析开销。
+            "WebcastRoomRankMessage" | "WebcastRoomStatsMessage" | "WebcastChatLikeMessage" => None,
             "WebcastHotChatMessage" => {
                 let content = extract_hot_chat_message(payload);
                 if !content.is_empty() {
                     Some(MessageType::HotChat(crate::models::HotChatMessage {
                         content,
-                        timestamp: chrono::Utc::now().timestamp(),
+                        timestamp,
                     }))
                 } else {
                     None
                 }
             }
-            _ => {
-                None
-            }
+            _ => None,
         }
     }
 }
