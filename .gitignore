@@ -1,1 +1,9 @@
 /target
+
+# 运行时生成的本地配置与签名文件
+config.json
+ws_sign.json
+
+# 日志
+*.log
+
