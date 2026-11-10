@@ -19,30 +19,34 @@ douyin-danmaku/
 ├── README.md          # 本文件：功能、运行方式、参考项目对照
 ├── AGENTS.md          # 给改代码的人/AI 协作者看的说明与协议结论
 ├── src/               # Rust 源码
-├── tests/             # 集成测试
+├── tests/             # 集成测试（当前为空，预留）
+├── examples/          # 示例程序（当前为空，预留）
 ├── docs/
 │   └── douyin_danmaku_rust_plan.md   # 立项时的实现计划（历史文档）
-└── 参考/
-    └── BarrageGrab/   # 第三方 C# 参考实现副本（只读，不参与构建）
+└── Cargo.toml
 ```
 
-`参考/BarrageGrab/` 是 [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8，MIT）的本地副本，只用于核对抖音协议字段，权威 proto 在 `参考/BarrageGrab/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto`。该目录**不纳入 git 版本管理**（已在 `.gitignore` 中排除），需要时按上面的仓库地址自行 clone。
+本项目是**单 crate**（包名 `douyin-danmaku`，二进制同名），没有 workspace，直接在本目录用 cargo 命令即可。
+
+参考实现全部为**在线开源仓库**，本仓库不包含任何第三方代码副本，核对协议字段时直接看在线源码：
+
+- [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8，MIT，gitee 主仓库）｜[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像）
+- 权威 proto：[BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto)
 
 ## 运行
 
 ```powershell
-# 直接运行（开发模式）
-cargo run --package douyin-danmaku --bin douyin-danmaku
+# 直接运行（开发模式）；`--` 之后的内容原样传给程序
+cargo run --release -- 123456789
 
-# 指定直播间：可以传短号，也可以直接粘直播间分享链接
-cargo run --package douyin-danmaku --bin douyin-danmaku 123456789
-cargo run --package douyin-danmaku --bin douyin-danmaku https://live.douyin.com/123456789
+# 也可以传直播间分享链接
+cargo run --release -- https://live.douyin.com/123456789
 
 # 用本机 Edge 的登录 Cookie 连接（需已在 Edge 登录抖音）
-cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
+cargo run --release -- 123456789 --edge-cookie
 ```
 
-不传房间号时，程序会提示你手动输入。构建产物在 `target/release/douyin-danmaku.exe`。
+不传房间号时，程序会提示你手动输入。构建产物在 `target/release/douyin-danmaku.exe`，也可以先 `cargo build --release` 再直接运行该 exe。
 
 ### 命令行参数
 
@@ -114,9 +118,9 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 | 本项目的能力 | 参考项目 | 具体借鉴内容 |
 | --- | --- | --- |
 | wss 直连、`internal_ext` 拼装、`identity=audience`、自取 `ttwid` | [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8）、[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像） | 抖音直播的连接参数拼装方式 |
-| 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 `参考/BarrageGrab/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto`（本地副本） | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
+| 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 [`BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto`](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto)（在线） | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
 | 抗风控：识别验证码中间页、放慢重试、缓存 `ttwid` / `room_id` | [lihuanpeng/DouyinBarrageGrab](https://github.com/lihuanpeng/DouyinBarrageGrab)（C#，MIT） | 实测抖音会对高频访问直播间页面的来源返回"验证码中间页"（约 6KB），本项目据此放慢重试并把 `ttwid`/`room_id` 缓存到本地，后续运行不再触碰页面 |
-| Cookie 只带 `ttwid`（页面请求与 WebSocket 握手都是） | BarrageGrab（`参考/BarrageGrab/BarrageGrab/GrabServices/DouyinBarrageGrabService.cs` 的 `GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | **实测**：① 握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101）；② 页面请求带上 msToken 会让服务端几乎恒定返回空壳页（拿不到 `roomId`），因此本项目**未采用** BarrageGrab 的 msToken/`__ac_nonce` 组合（详见「已调研、暂未实现」） |
+| Cookie 只带 `ttwid`（页面请求与 WebSocket 握手都是） | BarrageGrab（[`GrabServices/DouyinBarrageGrabService.cs`](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab/GrabServices/DouyinBarrageGrabService.cs) 的 `GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | **实测**：① 握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101）；② 页面请求带上 msToken 会让服务端几乎恒定返回空壳页（拿不到 `roomId`），因此本项目**未采用** BarrageGrab 的 msToken/`__ac_nonce` 组合（详见「已调研、暂未实现」） |
 | 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
 | protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
 | 心跳间隔跟随服务端 | [Simple Live 的协议拆解](https://blog.gitcode.com/0268abd9f86d85f8609446d3d803368e.html) | 服务端 `heartbeatDuration` 下发后按其心跳，客户端把间隔限制在 1~120 秒 |
@@ -131,7 +135,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 
 | 能力 | 可借鉴的项目 | 说明 |
 | --- | --- | --- |
-| msToken / `__ac_nonce` Cookie 组合 | BarrageGrab（`参考/BarrageGrab/BarrageGrab/GrabServices/DouyinBarrageGrabService.cs` 的 `GenerateMsToken`：107 位随机串；`__ac_nonce`：`0` + 20 位随机串） | **实测未采用**：页面请求带上 msToken 拿不到 `roomId`，握手带上 msToken/`__ac_nonce` 则被拒（417 not pass sign check）。若将来抖音放开这两项，可直接照 BarrageGrab 补上 |
+| msToken / `__ac_nonce` Cookie 组合 | BarrageGrab（[`GrabServices/DouyinBarrageGrabService.cs`](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab/GrabServices/DouyinBarrageGrabService.cs) 的 `GenerateMsToken`：107 位随机串；`__ac_nonce`：`0` + 20 位随机串） | **实测未采用**：页面请求带上 msToken 拿不到 `roomId`，握手带上 msToken/`__ac_nonce` 则被拒（417 not pass sign check）。若将来抖音放开这两项，可直接照 BarrageGrab 补上 |
 | IM 预取接口 | Simple Live 的协议拆解、jwwsjlm/douyinLive | 连接前先请求 `https://live.douyin.com/webcast/im/fetch/`，从响应里取 `pushServer` / `cursor` / `internalExt` / `heartbeatDuration`，比本项目硬编码 `webcast100-ws-web-lq` 域名与手工拼 `internal_ext` 更稳 |
 | 备用推送域名 | Simple Live、dyhub | 预生成 `webcast3/webcast5` 多组域名，连接失败自动切换并刷新上下文 |
 | 多房间并发 | jwwsjlm/douyinLive、dyhub | 每个房间独立任务与状态机，节点可横向扩容 |
@@ -152,14 +156,14 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 - 跑测试（含签名冒烟、帧协议解析、protobuf 解析性能对比）：
 
   ```powershell
-  cargo test --release --package douyin-danmaku --lib -- --nocapture
+  cargo test --release -- --nocapture
   ```
 
 - 看更细的错误栈：
 
   ```powershell
   $env:RUST_BACKTRACE = "1"
-  cargo run --package douyin-danmaku --bin douyin-danmaku 123456789
+  cargo run --release -- 123456789
   ```
 
 - 抓包对照：用浏览器开发者工具的 Network 面板过滤 `wss`，可以看到与本程序近似的 WebSocket 握手 URL 和参数。

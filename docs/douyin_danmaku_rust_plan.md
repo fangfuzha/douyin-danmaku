@@ -39,7 +39,7 @@ wss://webcast3-ws-web-hl.douyin.com/webcast/im/push/v2/
 | DouyinLiveWebFetcher | Python | 网页版弹幕抓取，支持最新接口 | — |
 | douyin-live-go | Golang | 高效直播数据采集工具 | — |
 | biliup | Python | 支持抖音弹幕录制 | — |
-| BarrageGrab | C#/.NET 8 | 抖音直播弹幕采集，协议定义最权威 | `参考/BarrageGrab/`（gitee.com/loveljsheng/BarrageGrab） |
+| BarrageGrab | C#/.NET 8 | 抖音直播弹幕采集，协议定义最权威 | https://gitee.com/loveljsheng/BarrageGrab （GitHub 镜像 https://github.com/error1983/BarrageGrab ） |
 
 ### 2.3 技术难点
 
@@ -92,8 +92,7 @@ douyin-danmaku/
 ├── examples/
 ├── docs/
 │   └── douyin_danmaku_rust_plan.md   # 本文档
-└── 参考/
-    └── BarrageGrab/             # 第三方 C# 参考实现副本（只读，不参与构建）
+└── docs/                        # 说明文档（参考实现均为在线仓库，不入本仓库）
 ```
 
 与原设想的差异：

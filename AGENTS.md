@@ -1,6 +1,6 @@
 # AGENTS.md
 
-面向在本仓库内工作的 AI 代理与协作者的说明。**所有路径均以本仓库根目录（`douyin-danmaku/`）为基准**。
+面向在本仓库内工作的 AI 代理与协作者的说明。**所有路径均以本仓库根目录（`douyin-danmaku/`）为基准**；这是单 crate 项目（包名与二进制同名 `douyin-danmaku`），没有 workspace，直接在根目录跑 cargo 即可。
 
 ## 项目是什么
 
@@ -24,27 +24,30 @@ douyin-danmaku/
 │   ├── models.rs                # 消息类型与展示格式化
 │   ├── config.rs                # 连接配置结构
 │   └── sign.js                  # 抖音网页签名脚本（由 QuickJS 执行）
-├── tests/                       # 集成测试
-├── examples/
-├── docs/
-│   └── douyin_danmaku_rust_plan.md   # 最初的实现计划（历史文档）
-└── 参考/
-    └── BarrageGrab/             # 第三方 C# 参考实现（只读，不参与构建）
+├── tests/                       # 集成测试（当前为空，预留）
+├── examples/                    # 示例程序（当前为空，预留）
+└── docs/
+    └── douyin_danmaku_rust_plan.md   # 最初的实现计划（历史文档）
 ```
 
-- `参考/BarrageGrab/` 是**第三方仓库副本**（gitee.com/loveljsheng/BarrageGrab，MIT），只在需要核对协议字段时查阅，**不要修改，也不要把它纳入 Cargo 构建**。权威 proto 在 `参考/BarrageGrab/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto`。该目录已被 `.gitignore` 排除，**不纳入版本管理**；换机器或重置工作区后按上面的仓库地址自行 clone 回来即可。
+- 本仓库**不包含任何第三方代码副本**。参考实现一律用在线仓库地址查阅：
+  - [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8，MIT，gitee 主仓库）｜[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像）
+  - 权威 proto：[BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto)
+  - Cookie/ttwid 相关：[GrabServices/DouyinBarrageGrabService.cs](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab/GrabServices/DouyinBarrageGrabService.cs)
+- 需要离线查阅时，可自行 clone 到工作区外的任意目录；**不要**把它放进本仓库的构建或版本管理。
 - `docs/douyin_danmaku_rust_plan.md` 是立项时的计划文档，与当前实现已有出入（见该文档末尾的「与当前实现的对齐情况」）。
 
 ## 常用命令
 
 ```powershell
 # 构建（跑 exe 前先停掉旧进程，否则 target\release\douyin-danmaku.exe 会被占用）
-cargo build --release --manifest-path .\Cargo.toml
+cargo build --release
 
 # 测试（lib + bin 单测）
-cargo test --release --manifest-path .\Cargo.toml -- --nocapture
+cargo test --release -- --nocapture
 
-# 运行（示例房间号）
+# 运行：`--` 之后原样传给程序；也可直接跑已构建的 exe
+cargo run --release -- 587795807816 --poll-secs 5
 .\target\release\douyin-danmaku.exe 587795807816 --poll-secs 5
 ```
 
@@ -65,7 +68,7 @@ cargo test --release --manifest-path .\Cargo.toml -- --nocapture
 - protobuf 解析走**零拷贝**扁平字段表，别改回 `HashMap<u32, Vec<...>>`（回归测试 `protobuf_zero_copy_matches_legacy_and_is_faster` 会对比旧实现并校验速度）。
 - 输出统一经 `Out`（64KB `BufWriter`，攒够 32 行或距上次刷新 ≥300ms 即落盘），所有事件经同一回调以保证顺序。
 - 签名日志只在 `--verbose` 时打印，否则重连会刷屏。
-- 新增协议字段前先查 `参考/BarrageGrab/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto`，不要凭记忆写字段号。
+- 新增协议字段前先查上游 [Douyin.proto](https://github.com/error1983/BarrageGrab/blob/master/BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto)（或 gitee 镜像的同名文件），不要凭记忆写字段号。
 
 ## 提交约定
 
@@ -74,6 +77,7 @@ cargo test --release --manifest-path .\Cargo.toml -- --nocapture
 - README 的「参考项目与实现对照」需同步更新：新增能力写进「已参考并落地的部分」，只调研没实现的写进「已调研、暂未实现」。
 - 删除文件用 `C:\Users\Admin\.minimax\bin\mavis-trash.cmd`（`Remove-Item` 会被安全策略拦截）。
 - `.gitignore` 改动请用 shell 写入（对 `.gitignore` 用 write/edit 会 EPERM）。
+- 本机可无头运行的 exe 只有本项目；跑测试不必先停进程，只有 `cargo build` 覆盖 exe 时才需要。
 
 ## 环境注意
 
