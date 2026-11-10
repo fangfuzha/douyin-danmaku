@@ -60,7 +60,8 @@ cargo run --release -- 587795807816 --poll-secs 5
 5. `ttwid` 与 `room_id` 缓存在 `%LOCALAPPDATA%\douyin-danmaku\`，跨次运行复用，避免再触页面；握手被判失效时自动清除缓存重取。
 6. **帧结构**：`PushFrame{seqId=1, logId=2, payloadType=7, payload=8}` → gzip → `Response{messagesList=1, cursor=2, internalExt=5, heartbeatDuration=8, needAck=9, pushServer=10}`；`Message{method=1, payload=2}`。心跳字节 `[0x3a, 0x02, 0x68, 0x62]`。
 7. **`room_id` 是场次标识**，每次开播都会变，不能当直播间稳定唯一 ID（短号才是）。
-8. 心跳间隔跟随服务端 `heartbeatDuration`（钳制 1~120 秒，>120 视为毫秒）；`needAck` 应答做成 `--ack` 开关且**默认关闭**。
+8. 心跳间隔跟随服务端 `heartbeatDuration`（钳制 1~120 秒，>120 视为毫秒）。
+9. **`needAck` 必须回应，否则服务端直接 RST 连接**（不发送 WebSocket close 帧，tungstenite 报 `Connection reset without closing handshake`）。实测：不回应时 200 秒内被断 8 次，回应后 200 秒内 0 次断连。因此应答**默认开启**，用 `--no-ack` 关闭（`--ack` 保留为兼容写法，等价于默认行为）。
 
 ## 代码约定
 

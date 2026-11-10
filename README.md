@@ -9,6 +9,7 @@
 - 签名在本地计算：内置抖音网页的 `sign.js`，由内嵌的 QuickJS 引擎执行，无需外部浏览器
 - **断线自动重连**（指数退避），**未开播时自动轮询等待开播**
 - 心跳间隔自适应服务端下发的 `heartbeatDuration`
+- 自动回应服务端 `needAck`（不回应会被服务端直接断开连接）
 
 ## 项目结构
 
@@ -57,7 +58,7 @@ cargo run --release -- 123456789 --edge-cookie
 | `--poll-secs <秒>` | `10` | 未开播时的轮询间隔 |
 | `--max-retries <次数>` | `0`（无限） | 断线重连的最大次数，0 表示一直重连 |
 | `--verbose` / `-v` | 关闭 | 打印签名中间值（MD5、signature）等调试信息 |
-| `--ack` | 关闭 | 开启服务端 `needAck` 应答（实验性，见下文） |
+| `--no-ack` | 关闭 | **不要**回应服务端 `needAck`（仅用于复现「不应答」行为，默认应答） |
 
 ## 输出说明
 
@@ -124,7 +125,7 @@ cargo run --release -- 123456789 --edge-cookie
 | 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
 | protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
 | 心跳间隔跟随服务端 | [Simple Live 的协议拆解](https://blog.gitcode.com/0268abd9f86d85f8609446d3d803368e.html) | 服务端 `heartbeatDuration` 下发后按其心跳，客户端把间隔限制在 1~120 秒 |
-| `needAck` 应答 | 同上（Simple Live 在 `needAck` 为真时回 `payloadType='ack'` 帧） | 本项目实现为可选开关 `--ack`（默认关闭：BarrageGrab 与 DouyinLiveWebFetcher 不回 ack 也能正常工作，保持默认行为以降低风险） |
+| `needAck` 应答 | 同上（Simple Live 在 `needAck` 为真时回 `payloadType='ack'` 帧） | 本项目**默认开启**应答（`--no-ack` 可关闭）。**实测**：不回应时服务端会直接 RST 掉连接（无 close 帧，报 `Connection reset without closing handshake`），200 秒内被断 8 次；回应后 200 秒内 0 次断连 |
 | 断线重连 | [jwwsjlm/douyinLive](https://github.com/jwwsjlm/douyinLive)（Go，LiveTap 的采集内核）、[tiangalon/dy_danmaku_java](https://github.com/tiangalon/dy_danmaku_java)（Java） | 断线自动重连 + 退避间隔 + 未开播轮询 + 保活 |
 | 抗风控/稳定性思路 | [lihuanpeng/DouyinBarrageGrab](https://github.com/lihuanpeng/DouyinBarrageGrab)（C#，MIT） | 轮询兜底模式、`room_id` 是场次标识的提醒 |
 | 事件类型枚举（表情弹幕、富文本等） | [haohanliubu/dydy](https://github.com/haohanliubu/dydy)（TypeScript/Vue） | `WebcastEmojiChatMessage`、`WebcastRoomDataSyncMessage`、`CastRtfContent` 等类型定义 |

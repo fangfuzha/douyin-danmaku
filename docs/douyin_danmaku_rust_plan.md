@@ -302,7 +302,7 @@ https://live.douyin.com/webcast/room/web/enter/
 | 步骤 2：实现登录模块（获取 Cookie） | 换方案实现 | 计划中的「本地 HTTP 服务器捕获登录回调」未采用；改为 `browser_cookie.rs`（Edge CDP 静默读取），游客身份则完全不需要登录 |
 | 步骤 3：实现 API 模块（获取 room_id） | 已完成，但换了接口 | 原计划的 `webcast/room/web/enter/` 需要签名参数，未使用；改为从直播间页面 HTML 提取 `roomId`，并与 ttwid 合并为同一重试循环 |
 | 步骤 4：实现签名模块 | 已完成 | 用 QuickJS 执行 `src/sign.js`；签名参数 13 个、顺序敏感，取自参考项目 |
-| 步骤 5：实现 WebSocket 客户端 | 已完成 | 额外做了断线重连（指数退避）、未开播轮询、心跳间隔跟随服务端 `heartbeatDuration`、`--ack` 应答开关 |
+| 步骤 5：实现 WebSocket 客户端 | 已完成 | 额外做了断线重连（指数退避）、未开播轮询、心跳间隔跟随服务端 `heartbeatDuration`、`needAck` 应答（默认开启，不回应会被服务端 RST） |
 | 步骤 6：实现 Protobuf 解析 | 已完成，换实现 | 未用 prost，改为零拷贝手写解析；帧结构按 `PushFrame`/`Response` 协议化解析 |
 | 步骤 7：实现主入口和配置 | 已完成 | 另有 `--poll-secs` / `--max-retries` / `--verbose` / `--edge-cookie` 等开关，以及 ttwid/room_id 本地缓存 |
 | 2.4 节的 ttwid 获取接口（`ttwid.bytedance.com` 注册接口） | **实测无效，未采用** | 该接口返回的是 bytedance/ixigua 域的 ttwid，带到 `live.douyin.com` 恒定拿到风控页；ttwid 只能来自直播间页面响应的 `Set-Cookie` |

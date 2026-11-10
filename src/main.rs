@@ -81,8 +81,10 @@ async fn main() -> Result<()> {
     };
 
     let use_edge_cookie = args.iter().any(|a| a == "--edge-cookie" || a == "--edge");
-    // needAck 应答（协议实验特性，默认关闭）
-    let enable_ack = args.iter().any(|a| a == "--ack");
+    // needAck 应答：服务端下发 needAck=1 后若不回应，会直接 RST 掉连接
+    //（表现为 "Connection reset without closing handshake"），因此默认开启；
+    // 仅在需要复现「不应答」行为时用 --no-ack 关闭。
+    let enable_ack = !args.iter().any(|a| a == "--no-ack");
     // 未开播时的轮询间隔（秒）
     let poll_secs = flag_value(&args, "--poll-secs").unwrap_or(10);
     // 最大重连次数，0 表示无限重连
