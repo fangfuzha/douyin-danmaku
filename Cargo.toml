@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.54.1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.13.5", features = ["json", "cookies"] }
 serde = { version = "1.0.229", features = ["derive"] }
