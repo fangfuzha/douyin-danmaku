@@ -110,6 +110,8 @@ pub enum MessageType {
     RoomStatsDetail(RoomStatsMessage),
     ChatLike(ChatLikeMessage),
     HotChat(HotChatMessage),
+    /// 协议层/系统事件（文本消息、直播结束、Ping/Pong 等）
+    System(String),
     Unknown(Vec<u8>),
 }
 
@@ -152,6 +154,9 @@ impl std::fmt::Display for MessageType {
             }
             MessageType::HotChat(msg) => {
                 write!(f, "[热门弹幕] {}", msg.content)
+            }
+            MessageType::System(text) => {
+                write!(f, "[系统] {}", text)
             }
             MessageType::Unknown(_) => {
                 write!(f, "[未知] 未知消息类型")

@@ -322,12 +322,15 @@ impl DanmakuClient {
         DanmakuClient
     }
 
-    pub async fn connect_with_sign<F>(&self, sign_config: &WsSignConfig, mut callback: F) -> Result<()>
+    /// 连接 WebSocket 并持续回调消息，返回接收到的消息条数。
+    pub async fn connect_with_sign<F>(&self, sign_config: &WsSignConfig, mut callback: F) -> Result<u64>
     where
-        F: FnMut(MessageType) + Send + 'static,
+        F: FnMut(MessageType) + Send,
     {
-        println!("使用真实签名直连 WebSocket");
-        println!("room_id: {}", sign_config.room_id);
+        callback(MessageType::System(format!(
+            "使用真实签名直连 WebSocket (room_id={})",
+            sign_config.room_id
+        )));
 
         let mut request = sign_config.ws_url.clone()
             .into_client_request()
@@ -349,7 +352,10 @@ impl DanmakuClient {
                 anyhow::anyhow!("Failed to connect to WebSocket: {:?}", e)
             })?;
 
-        println!("WebSocket 连接成功！状态: {:?}", response.status());
+        callback(MessageType::System(format!(
+            "WebSocket 连接成功！状态: {:?}",
+            response.status()
+        )));
 
         self.send_heartbeat(&mut ws_stream).await?;
 
@@ -368,13 +374,13 @@ impl DanmakuClient {
                             msg_count += count as u64;
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            println!("[文本消息] {}", text);
+                            callback(MessageType::System(format!("[文本消息] {}", text)));
                         }
                         Some(Ok(WsMessage::Ping(_))) => {
-                            println!("[Ping]");
+                            callback(MessageType::System("[Ping]".to_string()));
                         }
                         Some(Ok(WsMessage::Pong(_))) => {
-                            println!("[Pong]");
+                            callback(MessageType::System("[Pong]".to_string()));
                         }
                         Some(Ok(WsMessage::Close(msg))) => {
                             println!("[Close] {:?}", msg);
@@ -400,8 +406,7 @@ impl DanmakuClient {
             }
         }
 
-        println!("共接收 {} 条消息", msg_count);
-        Ok(())
+        Ok(msg_count)
     }
 
     /// 处理一帧数据：先处理 push 消息，再处理可能存在的 gzip（ack）消息。
@@ -542,7 +547,7 @@ impl DanmakuClient {
             "WebcastControlMessage" => {
                 let fields = parse_protobuf(payload);
                 if fields.varint(2) == Some(3) {
-                    println!("[系统消息] 直播已结束");
+                    return Some(MessageType::System("直播已结束".to_string()));
                 }
                 None
             }
