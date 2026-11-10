@@ -54,11 +54,6 @@ pub fn random_token(len: usize) -> String {
         .collect()
 }
 
-/// 生成 msToken（默认 107 位），参考 BarrageGrab
-pub fn generate_ms_token() -> String {
-    random_token(107)
-}
-
 /// 生成 __ac_nonce，参考 BarrageGrab：固定以 "0" 开头 + 20 位随机串
 pub fn generate_ac_nonce() -> String {
     format!("0{}", random_token(20))
@@ -179,86 +174,123 @@ pub async fn build_ws_url(
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
 
-/// 获取 ttwid 与 room_id。
+/// 访问直播间页面时使用的请求头。
 ///
-/// 分两步，与参考项目 BarrageGrab 的 GetTtwid / GetRoomId 保持一致：
-/// 1. 先请求直播间页面拿 ttwid（服务端并非每次响应都下发 ttwid，需要重试）；
-/// 2. 再带着 ttwid + msToken + __ac_nonce 请求页面，从 HTML 中提取 roomId。
-pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> {
-    let ttwid = fetch_ttwid(web_rid).await?;
-    let room_id = fetch_room_id(web_rid, &ttwid).await?;
-    Ok((ttwid, room_id))
+/// 实测：抖音会按请求头决定返回完整页面还是约 6KB 的空壳页，
+/// 缺少 Accept / Accept-Language / sec-fetch-* 等头时几乎只会拿到空壳页。
+fn page_headers(cookie: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    for (k, v) in [
+        ("user-agent", USER_AGENT),
+        ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+        ("accept-language", "zh-CN,zh;q=0.9,en;q=0.8"),
+        ("upgrade-insecure-requests", "1"),
+        ("sec-ch-ua", "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Microsoft Edge\";v=\"140\""),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("sec-fetch-dest", "document"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-site", "none"),
+        ("sec-fetch-user", "?1"),
+    ] {
+        let _ = cookie;
+        h.insert(
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            reqwest::header::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    if let Some(c) = cookie {
+        h.insert(
+            reqwest::header::HeaderName::from_bytes(b"cookie").unwrap(),
+            reqwest::header::HeaderValue::from_str(c).unwrap(),
+        );
+    }
+    h
 }
 
-/// 请求直播间页面，返回 (ttwid, 响应体)
-async fn request_live_page(web_rid: &str, cookie: Option<&str>) -> Result<(String, String)> {
+/// 获取 ttwid 与 room_id（同一个循环内完成，参考 BarrageGrab 的 GetTtwid / GetRoomId）。
+///
+/// 实测：抖音直播间页面存在「概率性返回空壳页」的现象——
+/// 同一 URL 有时返回 1MB+ 的完整页面（含 roomId），有时只返回约 6KB 的空壳页（无 roomId）；
+/// 同时响应头里的 ttwid 也只有约一半概率下发。
+/// 因此这里统一成一个重试循环：每次请求都尝试收集 ttwid 与 roomId，直到两者都拿到（最多 8 次）。
+pub async fn fetch_ttwid_and_room_id(web_rid: &str) -> Result<(String, String)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
 
+    // (1) ttwid 只能来自 live.douyin.com 页面响应的 Set-Cookie。
+    //     实测：抖音的 ttwid 注册接口（ttwid.bytedance.com）虽然稳定返回 ttwid，
+    //     但那是 bytedance/ixigua 域的值，带到 live.douyin.com 会一直拿到空壳页。
+    let mut ttwid = String::new();
+
     let url = format!("https://live.douyin.com/{}", web_rid);
-    let mut req = client.get(&url).header("User-Agent", USER_AGENT);
-    if let Some(c) = cookie {
-        req = req.header("cookie", c);
-    }
-
-    let resp = req.send().await.context("Failed to fetch live page")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("直播间页面返回 HTTP {}", resp.status());
-    }
-
-    // 优先从 Set-Cookie 头提取 ttwid
-    let set_cookies: Vec<String> = resp
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
-        .collect();
-    let body = resp.text().await.context("Failed to read response body")?;
-
-    let ttwid = extract_ttwid(&set_cookies)
-        .or_else(|| extract_ttwid_from_body(&body))
-        .unwrap_or_default();
-
-    Ok((ttwid, body))
-}
-
-/// 取 ttwid，最多尝试 5 次。
-///
-/// 参考 BarrageGrab 的 GetTtwid：服务端并非每次都下发 ttwid 头，
-/// 失败就重来，最多 5 次。
-async fn fetch_ttwid(web_rid: &str) -> Result<String> {
-    // 访问直播间页面时带上 __ac_nonce（参考 BarrageGrab）
-    let cookie = format!("__ac_nonce={}", generate_ac_nonce());
+    let mut room_id = String::new();
     let mut last_err = String::new();
+    let mut net_err = String::new();
 
-    for attempt in 1..=5u32 {
-        match request_live_page(web_rid, Some(&cookie)).await {
-            Ok((ttwid, _)) if !ttwid.is_empty() => return Ok(ttwid),
-            Ok(_) => last_err = "响应中未包含 ttwid".to_string(),
-            Err(e) => last_err = e.to_string(),
+    for attempt in 1..=8u32 {
+        // 页面请求的 Cookie：只带 ttwid；还没拿到 ttwid 时干脆不带 Cookie。
+        //
+        // 实测（live.douyin.com）：
+        // - 带 msToken 的组合（ttwid=..&msToken=..; __ac_nonce=..）几乎恒定返回
+        //   约 6KB 的空壳页（拿不到 roomId）；
+        // - 带任意 Cookie（含只有 __ac_nonce）时，服务端不再下发 ttwid；
+        // - 只带 ttwid 时，约三分之一概率返回完整页面（1MB+，含 roomId）。
+        let cookie = if ttwid.is_empty() {
+            None
+        } else {
+            Some(format!("ttwid={}", ttwid))
+        };
+
+        match client
+            .get(&url)
+            .headers(page_headers(cookie.as_deref()))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let set_cookies: Vec<String> = resp
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                    .collect();
+                let body = resp.text().await.unwrap_or_default();
+
+                if ttwid.is_empty() {
+                    ttwid = extract_ttwid(&set_cookies)
+                        .or_else(|| extract_ttwid_from_body(&body))
+                        .unwrap_or_default();
+                }
+                if room_id.is_empty() {
+                    if let Ok(id) = extract_room_id(&body) {
+                        room_id = id;
+                    }
+                }
+            }
+            Err(e) => net_err = e.to_string(),
         }
-        if attempt < 5 {
+
+        if !ttwid.is_empty() && !room_id.is_empty() {
+            return Ok((ttwid, room_id));
+        }
+
+        last_err = if !net_err.is_empty() {
+            format!("请求直播间页面失败：{}", net_err)
+        } else if ttwid.is_empty() {
+            "响应中未包含 ttwid".to_string()
+        } else {
+            "页面未包含 roomId（服务端返回了空壳页）".to_string()
+        };
+
+        if attempt < 8 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
-    anyhow::bail!("未能从响应中获取 ttwid（已重试 5 次）：{}", last_err)
-}
-
-/// 带 ttwid 请求页面并提取 roomId
-async fn fetch_room_id(web_rid: &str, ttwid: &str) -> Result<String> {
-    // 页面请求的 Cookie 与 BarrageGrab 一致：ttwid + msToken; __ac_nonce
-    let cookie = format!(
-        "ttwid={}&msToken={}; __ac_nonce={}",
-        ttwid,
-        generate_ms_token(),
-        generate_ac_nonce()
-    );
-
-    let (_, body) = request_live_page(web_rid, Some(&cookie)).await?;
-    extract_room_id(&body)
+    anyhow::bail!("未能获取直播间信息（已重试 8 次）：{}", last_err)
 }
 
 /// 从 Set-Cookie 头列表中提取 ttwid 值

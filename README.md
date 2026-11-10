@@ -68,8 +68,8 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 - 它相当于匿名会话的"设备身份"：WebSocket 连接必须带上它，否则服务端会拒绝连接或把连接降权
 - 有效期由服务端控制（通常一天量级），过期后重新访问直播间页面即可拿到新的
 - 程序里它来自访问直播间页面时响应头的 `Set-Cookie`，并在每次运行时重新获取；断线重连多次后也会自动刷新
-- 服务端并非每次响应都下发 `ttwid`，因此程序取不到时会**自动重试最多 5 次**（间隔 0.5 秒），仍失败才报错退出
-- 页面请求的 Cookie 与 BarrageGrab 一致：`ttwid` + `msToken`（107 位随机串）+ `__ac_nonce`（`0` + 20 位随机串），拿到 ttwid 后再请求一次页面从 HTML 中提取 `roomId`
+- 服务端并非每次响应都下发 `ttwid`（实测约一半概率有），且直播间页面本身约三分之一概率只返回约 6KB 的空壳页（里面没有 `roomId`）。程序因此把"取 ttwid + 取 roomId"放在同一个重试循环里，最多重试 8 次（间隔 0.5 秒）
+- 请求直播间页面时**只带 `ttwid`**（还没有 ttwid 时不带任何 Cookie）。实测：带上 `msToken`（BarrageGrab 用的 107 位随机串）或 `__ac_nonce` 会让服务端几乎恒定返回空壳页，取不到 `roomId`；带任意 Cookie 时服务端也不再下发 `ttwid`
 
 ### room_id
 
@@ -96,7 +96,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 | --- | --- | --- |
 | wss 直连、`internal_ext` 拼装、`identity=audience`、自取 `ttwid` | [BarrageGrab](https://gitee.com/loveljsheng/BarrageGrab)（C#/.NET 8）、[error1983/BarrageGrab](https://github.com/error1983/BarrageGrab)（GitHub 镜像） | 抖音直播的连接参数拼装方式 |
 | 帧结构（PushFrame / Response 字段号） | BarrageGrab 的 `BarrageGrab.Entity/Protobuf/Douyin/Douyin.proto` | `seqId=1`、`logId=2`、`payloadType=7`、`payload=8`；`messagesList=1`、`heartbeatDuration=8`、`needAck=9` |
-| Cookie 分工：**页面请求**带 `ttwid + msToken + __ac_nonce`，**WebSocket 握手只带 `ttwid`** | BarrageGrab（`GenerateMsToken` / `GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | msToken 为 107 位随机串，`__ac_nonce` 为 `0` + 20 位随机串。**实测**：握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101） |
+| Cookie 只带 `ttwid`（页面请求与 WebSocket 握手都是） | BarrageGrab（`GetTtwid` / `GetRoomId`，握手头 `cookie: ttwid={Ttwid}`）、[saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（`liveMan.py` 握手 cookie 同样是 `ttwid={self.ttwid}`） | **实测**：① 握手若带上 msToken/`__ac_nonce` 会被服务端拒绝（`handshake-status: 417`、`handshake-msg: "not pass sign check"`）并陷入重连循环，只带 ttwid 才能握手成功（状态 101）；② 页面请求带上 msToken 会让服务端几乎恒定返回空壳页（拿不到 `roomId`），因此本项目**未采用** BarrageGrab 的 msToken/`__ac_nonce` 组合（详见「已调研、暂未实现」） |
 | 签名参数（13 个、顺序敏感） | [saermart/DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher)（Python）、[littlezo/dy-danmu](https://github.com/littlezo/dy-danmu)（Go） | `frontierSign` / `sign.js` 的签名思路；dy-danmu 用 Go 的 JS 解释器算签名，与本项目用 QuickJS 跑 `sign.js` 是同一路数 |
 | protobuf 解析 | DouyinLiveWebFetcher 的 `douyin.proto`、dyhub 的消息类型枚举 | 消息体字段定义 |
 | 心跳间隔跟随服务端 | [Simple Live 的协议拆解](https://blog.gitcode.com/0268abd9f86d85f8609446d3d803368e.html) | 服务端 `heartbeatDuration` 下发后按其心跳，客户端把间隔限制在 1~120 秒 |
@@ -111,6 +111,7 @@ cargo run --package douyin-danmaku --bin douyin-danmaku 123456789 --edge-cookie
 
 | 能力 | 可借鉴的项目 | 说明 |
 | --- | --- | --- |
+| msToken / `__ac_nonce` Cookie 组合 | BarrageGrab（`GenerateMsToken`：107 位随机串；`__ac_nonce`：`0` + 20 位随机串） | **实测未采用**：页面请求带上 msToken 会让 live.douyin.com 几乎恒定返回空壳页（取不到 `roomId`），握手带上 msToken/`__ac_nonce` 则被拒（417 not pass sign check）。若将来抖音放开这两项，可直接照 BarrageGrab 补上 |
 | IM 预取接口 | Simple Live 的协议拆解、jwwsjlm/douyinLive | 连接前先请求 `https://live.douyin.com/webcast/im/fetch/`，从响应里取 `pushServer` / `cursor` / `internalExt` / `heartbeatDuration`，比本项目硬编码 `webcast100-ws-web-lq` 域名与手工拼 `internal_ext` 更稳 |
 | 备用推送域名 | Simple Live、dyhub | 预生成 `webcast3/webcast5` 多组域名，连接失败自动切换并刷新上下文 |
 | 多房间并发 | jwwsjlm/douyinLive、dyhub | 每个房间独立任务与状态机，节点可横向扩容 |
