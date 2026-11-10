@@ -9,7 +9,6 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"]
 reqwest = { version = "0.13.5", features = ["json", "cookies"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-url = "2.5.8"
 anyhow = "1.0.104"
 regex = "1.13.1"
 rand = "0.10.3"
@@ -18,7 +17,4 @@ futures-util = "0.3.34"
 flate2 = "1.1.11"
 rquickjs = { version = "0.14.0", features = ["classes", "properties"] }
 md-5 = "0.11.0"
-base64 = "0.23.1"
-rusqlite = { version = "0.41.1", features = ["bundled"] }
-aes-gcm = "0.11.1"
 windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
